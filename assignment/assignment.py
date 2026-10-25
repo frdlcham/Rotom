@@ -31,7 +31,7 @@ from assignment.gen.gen_product import gen_product
 from assignment.gen.gen_cast import gen_cast
 from assignment.gen.gen_mean import gen_mean
 from assignment.gen.gen_conv2d import gen_conv2d, gen_conv2d_roll
-from assignment.gen.gen_conv3d import gen_conv3d
+from assignment.gen.gen_conv3d import gen_conv3d, gen_depthwise_conv3d
 from assignment.gen.gen_index import gen_index
 from assignment.gen.gen_permute import gen_permute
 from assignment.gen.gen_poly_call import gen_poly_call
@@ -43,6 +43,7 @@ from assignment.gen.gen_tensor import gen_tensor
 from assignment.gen.gen_tile import gen_tile
 from assignment.gen.gen_transpose import gen_transpose
 from frontends.tensor import TensorOp, TensorTerm
+from frontends.tensor_args import Conv3dArgs
 
 # import layout assignment components
 from ir.analysis.secret import Secret
@@ -199,7 +200,10 @@ class LayoutAssignment:
                     kernels = gen_conv2d(term, cs_kernels[0], cs_shapes)
             case TensorOp.CONV3D:
                 cs_shapes = self.get_unpadded_cs_shapes(term)
-                kernels = gen_conv3d(term, cs_kernels[0], cs_shapes)
+                if Conv3dArgs.from_term(term).depthwise:
+                    kernels = gen_depthwise_conv3d(term, cs_kernels[0], cs_shapes)
+                else:
+                    kernels = gen_conv3d(term, cs_kernels[0], cs_shapes)
             case TensorOp.RESHAPE:
                 kernels = gen_reshape(term, cs_kernels[0])
             case TensorOp.PERMUTE:

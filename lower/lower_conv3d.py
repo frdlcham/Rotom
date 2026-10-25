@@ -1,5 +1,6 @@
 import numpy as np
 
+from frontends.tensor_args import Conv3dArgs
 from ir.analysis.shape import Shape
 from ir.dim import DimType
 from ir.he import HEOp, HETerm
@@ -368,3 +369,90 @@ def lower_conv3d(env, kernel):
         layout_cts = LayoutCiphertexts(layout=layout_cts.layout, cts=masked_cts)
 
     return layout_cts
+
+
+def _logical_slot_coords(layout, ndims: int = 4) -> np.ndarray:
+    """(num_ct, n, ndims) logical tensor coordinate held by each slot (-1 = none)."""
+    plan = _get_apply_layout_plan(
+        layout, ndims, layout_len=max(len(layout), layout.n)
+    )
+    rows = plan["base_indices_by_cts"]
+    if rows.shape[2] < ndims:
+        pad = np.zeros(rows.shape[:2] + (ndims - rows.shape[2],), dtype=rows.dtype)
+        rows = np.concatenate([rows, pad], axis=2)
+    return rows.astype(np.int64)
+
+
+def lower_depthwise_conv3d(env, kernel):
+    """Lower DEPTHWISE_CONV3D: out = sum_taps rot(in, r) * mask * w_tap.
+
+    For each output ciphertext and filter tap, every valid output slot reads one
+    input slot; slots are grouped by (source ct, rotation) so a dense layout costs
+    one rotation per tap per ciphertext. ``w_tap`` is the packed public filter
+    (see ``depthwise_conv3d_filter_layout``); masks zero padding and out-of-range
+    slots.
+    """
+    a_cts = env[kernel.cs[0]]
+    b_cts = env[kernel.cs[1]]
+    in_layout = kernel.cs[0].layout
+    out_layout = kernel.layout
+    term = out_layout.term
+    n = int(out_layout.n)
+
+    in_shape = np.array(get_term_shape(term.cs[0]), dtype=np.int64)
+    k_dhw = [int(k) for k in get_term_shape(term.cs[1])[1:]]
+    strides = np.array(term.cs[2], dtype=np.int64)
+    out_dhw, front = Conv3dArgs.depthwise_geometry(
+        in_shape[1:], k_dhw, term.cs[2], term.cs[3]
+    )
+    out_shape = np.array([in_shape[0]] + out_dhw, dtype=np.int64)
+    front = np.array(front, dtype=np.int64)
+
+    # Logical input coordinate -> flat (ct * n + slot).
+    in_rows = _logical_slot_coords(in_layout)
+    lookup = np.full(int(np.prod(in_shape)), -1, dtype=np.int64)
+    flat_rows = in_rows.reshape(-1, 4)
+    ok = np.all((flat_rows >= 0) & (flat_rows < in_shape), axis=1)
+    lookup[np.ravel_multi_index(flat_rows[ok].T, in_shape)] = np.nonzero(ok)[0]
+
+    out_rows = _logical_slot_coords(out_layout)
+    num_out_ct = out_rows.shape[0]
+    slots = np.arange(n, dtype=np.int64)
+    taps = [
+        (i, j, k)
+        for i in range(k_dhw[0])
+        for j in range(k_dhw[1])
+        for k in range(k_dhw[2])
+    ]
+
+    mask_terms: dict[bytes, HETerm] = {}
+    cts = {}
+    for o in range(num_out_ct):
+        rows = out_rows[o]
+        valid_out = np.all((rows >= 0) & (rows < out_shape), axis=1)
+        acc = None
+        for tap_idx, tap in enumerate(taps):
+            src = rows[:, 1:] * strides + np.array(tap) - front
+            valid = valid_out & np.all((src >= 0) & (src < in_shape[1:]), axis=1)
+            if not valid.any():
+                continue
+            src_coords = np.concatenate([rows[valid, :1], src[valid]], axis=1)
+            src_flat = lookup[np.ravel_multi_index(src_coords.T, in_shape)]
+            assert (src_flat >= 0).all(), "input voxel missing from input layout"
+            src_ct, src_slot = src_flat // n, src_flat % n
+            rot = (src_slot - slots[valid]) % n
+            w = b_cts[tap_idx * num_out_ct + o]
+            groups: dict[tuple[int, int], np.ndarray] = {}
+            for key in set(zip(src_ct.tolist(), rot.tolist())):
+                groups[key] = np.zeros(n, dtype=np.int32)
+            for c, r, s in zip(src_ct.tolist(), rot.tolist(), slots[valid].tolist()):
+                groups[(c, r)][s] = 1
+            for (c, r), m in sorted(groups.items()):
+                key = m.tobytes()
+                if key not in mask_terms:
+                    mask_terms[key] = HETerm.mask([m.tolist()])
+                moved = a_cts[c] if r == 0 else a_cts[c] << int(r)
+                t = moved * mask_terms[key] * w
+                acc = t if acc is None else acc + t
+        cts[o] = acc if acc is not None else HETerm(HEOp.ZERO_MASK, [], False)
+    return LayoutCiphertexts(layout=out_layout, cts=cts)

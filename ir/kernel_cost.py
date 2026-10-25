@@ -697,6 +697,15 @@ class KernelCost:
                 ops = self.conv2d_roll_ops(ops)
             case KernelOp.CONV2D:
                 ops = self.conv2d_ops(ops)
+            case KernelOp.DEPTHWISE_CONV3D:
+                # per output ct and filter tap: one rotation, two pt mults, one add
+                taps = self.kernel.cs[1].layout.num_ct() // max(
+                    1, self.kernel.layout.num_ct()
+                )
+                work = taps * self.kernel.layout.num_ct()
+                ops["rot"] += work
+                ops["mul"] += 2 * work
+                ops["add"] += work
             case KernelOp.CONV3D:
                 ops = self.conv2d_ops(ops)
             case KernelOp.ROLL:
@@ -838,7 +847,7 @@ class KernelCost:
                     case KernelOp.MATMUL | KernelOp.CONV2D:
                         # HACK: depth actually varies if masking is required or not
                         d += 2
-                    case KernelOp.CONV3D:
+                    case KernelOp.CONV3D | KernelOp.DEPTHWISE_CONV3D:
                         d += 2
                     case _:
                         raise NotImplementedError(term.op)

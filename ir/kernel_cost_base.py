@@ -244,6 +244,15 @@ class KernelCost(MatmulCostMixin, ConvCostMixin, RollCostMixin):
                 ops = self.strassen_ops(ops)
             case KernelOp.CONV2D_ROLL:
                 ops = self.conv2d_roll_ops(ops)
+            case KernelOp.DEPTHWISE_CONV3D:
+                # per output ct and filter tap: one rotation, two pt mults, one add
+                taps = self.kernel.cs[1].layout.num_ct() // max(
+                    1, self.kernel.layout.num_ct()
+                )
+                work = taps * self.kernel.layout.num_ct()
+                ops["rot"] += work
+                ops["mul"] += 2 * work
+                ops["add"] += work
             case KernelOp.CONV2D | KernelOp.CONV3D:
                 # ConvCostMixin only defines conv2d_ops; it is layout-geometry based and
                 # applies equally to 3D conv kernels.
@@ -350,7 +359,12 @@ class KernelCost(MatmulCostMixin, ConvCostMixin, RollCostMixin):
                         pass
                     case KernelOp.MUL | KernelOp.ROLL | KernelOp.CONVERSION:
                         d += 1
-                    case KernelOp.MATMUL | KernelOp.CONV2D | KernelOp.CONV3D:
+                    case (
+                        KernelOp.MATMUL
+                        | KernelOp.CONV2D
+                        | KernelOp.CONV3D
+                        | KernelOp.DEPTHWISE_CONV3D
+                    ):
                         d += 2
                     case _:
                         raise NotImplementedError(term.op)
