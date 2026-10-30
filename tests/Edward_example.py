@@ -65,7 +65,7 @@ filter_project_conv = TensorTerm.Tensor("filter_project_conv", [filter_shape_3rd
 bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T, H/(STRIDE_conv_3*STRIDE_conv_2*STRIDE_conv_1), W/(STRIDE_conv_3*STRIDE_conv_2*STRIDE_conv_1)], False)  # bias plaintext vector
 
 output_expand_conv = TensorTerm.conv3d(input, filter_expand_conv, stride=STRIDE_conv_1, padding="same") + bias_expand_conv
-output_depth_conv = TensorTerm.conv3d(output_expand_conv, filter_depth_conv, stride=STRIDE_conv_2, padding="same") + bias_depth_conv
+output_depth_conv = TensorTerm.conv3d(output_expand_conv, filter_depth_conv, STRIDE_conv_2, "same", "depthwise") + bias_depth_conv
 output_project_conv = TensorTerm.conv3d(output_depth_conv, filter_project_conv, stride=STRIDE_conv_3, padding="same") + bias_project_conv
 
 # Run layout assignment for last conv
