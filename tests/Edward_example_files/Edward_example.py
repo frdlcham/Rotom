@@ -74,12 +74,30 @@ bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T, H//2, W/
 
 output_expand_conv = TensorTerm.conv3d(input, filter_expand_conv, stride=STRIDE_conv_1, padding="same") + bias_expand_conv
 output_depth_conv = TensorTerm.depthwise_conv3d(output_expand_conv, filter_depth_conv, STRIDE_conv_2, "same") + bias_depth_conv
+
 output_project_conv = TensorTerm.conv3d(output_depth_conv, filter_project_conv, stride=STRIDE_conv_3, padding="same") + bias_project_conv
+
+# rule: if Kd = Kh = Kw = 1, flatten the tensor since spacial info in frames isn't used
+# and then pad the flattened tensor instead of padding each dimension, to save space (?)
+
+# need to somehow get rid of the padded stuff and keep the non-padded stuff of output_depth_conv
+# how can I do that without array indexing in the ciphertext? hmm
+
+flattened_output_depth_conv = TensorTerm.flatten(output_depth_conv, 1, 3)
+filter_shape_3rd_2d = [C_out_3, C_in_3, 1, 1] # C_out, C_in, K, K
+filter_project_conv_2d = TensorTerm.Tensor("filter_project_conv_2d", filter_shape_3rd_2d, False)  # filter plaintext matrix
+bias_project_conv_2d = np.broadcast_to(np.random.randn(C_out_3)[:, None], (C_out_3, T * H//2 * W//2)).copy()
+
+output_project_conv_2d = TensorTerm.conv2d(flattened_output_depth_conv, filter_project_conv_2d, stride=STRIDE_conv_3, padding="same") + bias_project_conv_2d
+
 
 # Run layout assignment for last conv
 # Since the other convs are in the input of last conv? unsure if this works
 args = argparse.Namespace(n=32768, rolls=True, backend="toy")
+
 kernel = LayoutAssignment(output_project_conv, args).run()
+
+# kernel = LayoutAssignment(output_project_conv_2d, args).run()
 
 # All layouts, inputs first and output last
 for k in kernel.post_order():

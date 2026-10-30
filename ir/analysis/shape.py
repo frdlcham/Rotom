@@ -215,7 +215,10 @@ class Shape:
 
                 _c_i = a_shape[0]
                 h_i = logical_a[1]
-                w_i = logical_a[2]
+                if(len(a_shape)>=3):
+                    w_i = logical_a[2]
+                else:
+                    w_i = 1
 
                 # Logical output channels (match layout gen / eval; filter c_out is not p2-padded).
                 c_o = logical_b[0]
@@ -419,7 +422,10 @@ class Shape:
                 else:
                     f_h, f_w = b_shape[1], b_shape[2]  # 3D: assume c_in=1
                 h_i = a_shape[1]
-                w_i = a_shape[2]
+                if (len(a_shape)>=3):
+                    w_i = a_shape[2]
+                else:
+                    w_i = 1
 
                 stride = args.stride
                 padding = args.padding
