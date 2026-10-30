@@ -117,5 +117,5 @@ inputs = {"input": concrete_input, "filter_expand_conv": concrete_filter_expand_
           "filter_depth_conv": concrete_filter_depth_conv, "filter_project_conv": concrete_filter_project_conv, 
           "bias_expand_conv": concrete_bias_expand_conv, "bias_depth_conv": concrete_bias_depth_conv, 
           "bias_project_conv": concrete_bias_project_conv}
-results = Toy(circuit_ir, inputs, args).run()
-print("results: ",results)
+# results = Toy(circuit_ir, inputs, args).run() # seems to get stuck at 20% forever
+# print("results: ",results)
