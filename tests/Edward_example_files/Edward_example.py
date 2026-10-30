@@ -12,32 +12,42 @@ from lower.lower import Lower
 
 # SHAPES - doesn't seem to matter if the dimensions are powers of 2 or not?
 # layout always works, actual conv always fails with a mismatch between toy and the expected output
-T = 5
-H = 28
-W = 28
+# T = 5
+# H = 28
+# W = 28
 
+# C_in_1 = 32 # channels input to first conv
+# C_out_1 = 184
+
+# C_in_2 = C_out_1
+# C_out_2 = C_in_2 # 2nd conv keeps channels the same
+
+# C_in_3 = C_out_2
+# C_out_3 = 56
+
+# T, H, and W, padded to powers of 2
+T = 8
+H = 32
+W = 32
+
+# Channels padded to powers of 2
 C_in_1 = 32 # channels input to first conv
-C_out_1 = 184
+C_out_1 = 256
 
 C_in_2 = C_out_1
 C_out_2 = C_in_2 # 2nd conv keeps channels the same
 
 C_in_3 = C_out_2
-C_out_3 = 56
-
-# T, H, and W, padded to powers of 2
-# T = 8
-# H = 32
-# W = 32
+C_out_3 = 64
 
 STRIDE_conv_1 = 1
-STRIDE_conv_2 = 2
+STRIDE_conv_2 = (1, 2, 2)
 STRIDE_conv_3 = 1
 
 # pretty sure that 1st and 3rd conv don't go across frames
 # unsure if I'm specifying these shapes correctly
 filter_shape_1st_conv = [C_out_1, C_in_1, 1, 1, 1]  # C_out, C_in, Kd, Kh, Kw
-filter_shape_2nd_conv = [1, 1, T, 3, 3]  # don't think this matches depthwise conv?
+filter_shape_2nd_conv = [C_out_2, T, 3, 3] # C, Kd, Kh, Kw
 filter_shape_3rd_conv = [C_out_3, C_in_3, 1, 1, 1] # C_out, C_in, Kd, Kh, Kw
 
 # # CONCRETE INPUTS AND KERNELS - only needed if operation is actually executed
@@ -55,17 +65,17 @@ filter_shape_3rd_conv = [C_out_3, C_in_3, 1, 1, 1] # C_out, C_in, Kd, Kh, Kw
 # Create tensor operations
 input = TensorTerm.Tensor("input", [C_in_1, T, H, W], True)  #input ciphertext matrix
 filter_expand_conv = TensorTerm.Tensor("filter_expand_conv", [filter_shape_1st_conv[0], filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4]], False)  # filter plaintext matrix
-bias_expand_conv = TensorTerm.Tensor("bias_expand_conv", [C_out_1, T, H/STRIDE_conv_1, W/STRIDE_conv_1], False)  # bias plaintext vector
+bias_expand_conv = TensorTerm.Tensor("bias_expand_conv", [C_out_1, T, H, W], False)  # bias plaintext vector
 # having some issue with bias_expand_conv, prob due to the fact that conv2 is not proper depthwise
 
-filter_depth_conv = TensorTerm.Tensor("filter_depth_conv", [filter_shape_2nd_conv[0], filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3], filter_shape_2nd_conv[4]], False)  # filter plaintext matrix
-bias_depth_conv = TensorTerm.Tensor("bias_depth_conv", [C_out_2, T, H/(STRIDE_conv_2*STRIDE_conv_1), W/(STRIDE_conv_2*STRIDE_conv_1)], False)  # bias plaintext vector
+filter_depth_conv = TensorTerm.Tensor("filter_depth_conv", [filter_shape_2nd_conv[0], filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3]], False)  # filter plaintext matrix
+bias_depth_conv = TensorTerm.Tensor("bias_depth_conv", [C_out_2, T, H//2, W//2], False)  # bias plaintext vector
 
 filter_project_conv = TensorTerm.Tensor("filter_project_conv", [filter_shape_3rd_conv[0], filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4]], False)  # filter plaintext matrix
-bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T, H/(STRIDE_conv_3*STRIDE_conv_2*STRIDE_conv_1), W/(STRIDE_conv_3*STRIDE_conv_2*STRIDE_conv_1)], False)  # bias plaintext vector
+bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T, H, W], False)  # bias plaintext vector
 
 output_expand_conv = TensorTerm.conv3d(input, filter_expand_conv, stride=STRIDE_conv_1, padding="same") + bias_expand_conv
-output_depth_conv = TensorTerm.conv3d(output_expand_conv, filter_depth_conv, STRIDE_conv_2, "same", "depthwise") + bias_depth_conv
+output_depth_conv = TensorTerm.depthwise_conv3d(output_expand_conv, filter_depth_conv, STRIDE_conv_2, "same") + bias_depth_conv
 output_project_conv = TensorTerm.conv3d(output_depth_conv, filter_project_conv, stride=STRIDE_conv_3, padding="same") + bias_project_conv
 
 # Run layout assignment for last conv
