@@ -50,17 +50,15 @@ filter_shape_1st_conv = [C_out_1, C_in_1, 1, 1, 1]  # C_out, C_in, Kd, Kh, Kw
 filter_shape_2nd_conv = [C_out_2, T, 3, 3] # C, Kd, Kh, Kw
 filter_shape_3rd_conv = [C_out_3, C_in_3, 1, 1, 1] # C_out, C_in, Kd, Kh, Kw
 
-# # CONCRETE INPUTS AND KERNELS - only needed if operation is actually executed
-# concrete_input = np.random.randn(C_in_1, T, H, W)  # input frames, [C_in, D_in, H_in, W_in]
-# concrete_filter_expand_conv = np.random.randn(filter_shape_1st_conv[0], filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4])
-# concrete_filter_depth_conv = np.random.randn(filter_shape_2nd_conv[0], filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3], filter_shape_2nd_conv[4])
-# concrete_filter_project_conv = np.random.randn(filter_shape_3rd_conv[0], filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4])
-# concrete_bias_expand_conv = np.random.randn(C_out_1)  # bias for depthwise conv, one per output channel
-# would then need to broadcast this bias to [C_out_1, T, H/STRIDE_conv_1, W/STRIDE_conv_1] for the first conv
-# concrete_bias_depth_conv = np.random.randn(C_out_2)  # bias for depthwise conv, one per output channel
-# then broadcast this bias to [C_out_2, T, H/(STRIDE_conv_2*STRIDE_conv_1), W/(STRIDE_conv_2*STRIDE_conv_1)] for the second conv
-# concrete_bias_project_conv = np.random.randn(C_out_3)  # bias for depthwise conv, one per output channel
-# then broadcast this bias to [C_out_3, T, H/(STRIDE_conv_3*STRIDE_conv_2*STRIDE_conv_1), W/(STRIDE_conv_3*STRIDE_conv_2*STRIDE_conv_1)] for the third conv
+# CONCRETE INPUTS AND KERNELS - only needed if operation is actually executed
+concrete_input = np.random.randn(C_in_1, T, H, W)  # input frames, [C_in, D_in, H_in, W_in]
+concrete_filter_expand_conv = np.random.randn(filter_shape_1st_conv[0], filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4])
+concrete_filter_depth_conv = np.random.randn(filter_shape_2nd_conv[0], filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3])
+concrete_filter_project_conv = np.random.randn(filter_shape_3rd_conv[0], filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4])
+
+concrete_bias_expand_conv  = np.broadcast_to(np.random.randn(C_out_1)[:, None, None, None], (C_out_1, T, H, W)).copy()
+concrete_bias_depth_conv   = np.broadcast_to(np.random.randn(C_out_2)[:, None, None, None], (C_out_2, T, H//2, W//2)).copy()
+concrete_bias_project_conv = np.broadcast_to(np.random.randn(C_out_3)[:, None, None, None], (C_out_3, T, H//2, W//2)).copy()
 
 # Create tensor operations
 input = TensorTerm.Tensor("input", [C_in_1, T, H, W], True)  #input ciphertext matrix
@@ -87,7 +85,7 @@ kernel = LayoutAssignment(output_project_conv, args).run()
 for k in kernel.post_order():
     print(k)
 
-# annotated output of this file:
+# OLD annotated output of this file:
 # KernelOp.TENSOR: input [0:64:4];[0:4:1][1:8:1][2:32:1][3:32:1]
 # KernelOp.REPLICATE: [R:184:125440][0:64:4];[0:4:1][1:8:1][2:32:1][3:32:1] -> input packing to #1
 
@@ -112,3 +110,12 @@ for k in kernel.post_order():
 # KernelOp.PUNCTURED_TENSOR: filter_project_conv [0:56:1];[G:4][R:4:1][G:2][R:16:1][G:2][R:16:1][G:2]
 
 # KernelOp.CONV3D: [0:56:1];[G:4][1:4:1][G:2][2:16:1][G:2][3:16:1][G:2]
+
+# LOWERING
+circuit_ir = Lower(kernel).run()
+inputs = {"input": concrete_input, "filter_expand_conv": concrete_filter_expand_conv, 
+          "filter_depth_conv": concrete_filter_depth_conv, "filter_project_conv": concrete_filter_project_conv, 
+          "bias_expand_conv": concrete_bias_expand_conv, "bias_depth_conv": concrete_bias_depth_conv, 
+          "bias_project_conv": concrete_bias_project_conv}
+results = Toy(circuit_ir, inputs, args).run()
+print("results: ",results)
