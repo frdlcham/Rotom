@@ -62,14 +62,14 @@ concrete_bias_project_conv = np.broadcast_to(np.random.randn(C_out_3)[:, None, N
 
 # Create tensor operations
 input = TensorTerm.Tensor("input", [C_in_1, T, H, W], True)  #input ciphertext matrix
-filter_expand_conv = TensorTerm.Tensor("filter_expand_conv", [filter_shape_1st_conv[0], filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4]], False)  # filter plaintext matrix
+filter_expand_conv = TensorTerm.Tensor("filter_expand_conv", filter_shape_1st_conv, False)  # filter plaintext matrix
 bias_expand_conv = TensorTerm.Tensor("bias_expand_conv", [C_out_1, T, H, W], False)  # bias plaintext vector
 # having some issue with bias_expand_conv, prob due to the fact that conv2 is not proper depthwise
 
-filter_depth_conv = TensorTerm.Tensor("filter_depth_conv", [filter_shape_2nd_conv[0], filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3]], False)  # filter plaintext matrix
+filter_depth_conv = TensorTerm.Tensor("filter_depth_conv", filter_shape_2nd_conv, False)  # filter plaintext matrix
 bias_depth_conv = TensorTerm.Tensor("bias_depth_conv", [C_out_2, T, H//2, W//2], False)  # bias plaintext vector
 
-filter_project_conv = TensorTerm.Tensor("filter_project_conv", [filter_shape_3rd_conv[0], filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4]], False)  # filter plaintext matrix
+filter_project_conv = TensorTerm.Tensor("filter_project_conv", filter_shape_3rd_conv, False)  # filter plaintext matrix
 bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T, H//2, W//2], False)  # bias plaintext vector
 
 output_expand_conv = TensorTerm.conv3d(input, filter_expand_conv, stride=STRIDE_conv_1, padding="same") + bias_expand_conv
@@ -85,37 +85,11 @@ kernel = LayoutAssignment(output_project_conv, args).run()
 for k in kernel.post_order():
     print(k)
 
-# OLD annotated output of this file:
-# KernelOp.TENSOR: input [0:64:4];[0:4:1][1:8:1][2:32:1][3:32:1]
-# KernelOp.REPLICATE: [R:184:125440][0:64:4];[0:4:1][1:8:1][2:32:1][3:32:1] -> input packing to #1
-
-# KernelOp.PUNCTURED_TENSOR: filter_expand_conv [0:184:1][1:64:4];[1:4:1][R:8192:1]
-
-# KernelOp.CONV3D: [0:184:1];[G:4][1:8:1][2:32:1][3:32:1]
-
-
-# KernelOp.REPLICATE: [R:3:1][0:184:1];[G:4][1:8:1][2:32:1][3:32:1]
-# KernelOp.REPLICATE: [R:9:1][0:184:1];[G:4][1:8:1][2:32:1][3:32:1]
-# KernelOp.REPLICATE: [R:45:1][0:184:1];[G:4][1:8:1][2:32:1][3:32:1] -> input packing to #2
-# That's equal to: [R:45:1][C:184:1];[G:4][T:8:1][H:32:1][W:32:1]
-# Edward found:      [C:6][H:2][W:2];[H:14:1][W:14:1][T:5:1][C:32:1]
-
-# KernelOp.PUNCTURED_TENSOR: filter_depth_conv [2:5:1][3:3:1][4:3:1][1:184:1];[G:4][R:8192:1]
-
-# KernelOp.CONV3D: [G:4][1:4:1][G:2][2:16:1][G:2][3:16:1][G:2]
-
-
-# KernelOp.REPLICATE: [R:56:108192];[G:4][1:4:1][G:2][2:16:1][G:2][3:16:1][G:2] -> input packing to #3
-
-# KernelOp.PUNCTURED_TENSOR: filter_project_conv [0:56:1];[G:4][R:4:1][G:2][R:16:1][G:2][R:16:1][G:2]
-
-# KernelOp.CONV3D: [0:56:1];[G:4][1:4:1][G:2][2:16:1][G:2][3:16:1][G:2]
-
-# LOWERING
-circuit_ir = Lower(kernel).run()
-inputs = {"input": concrete_input, "filter_expand_conv": concrete_filter_expand_conv, 
-          "filter_depth_conv": concrete_filter_depth_conv, "filter_project_conv": concrete_filter_project_conv, 
-          "bias_expand_conv": concrete_bias_expand_conv, "bias_depth_conv": concrete_bias_depth_conv, 
-          "bias_project_conv": concrete_bias_project_conv}
+# # LOWERING
+# circuit_ir = Lower(kernel).run()
+# inputs = {"input": concrete_input, "filter_expand_conv": concrete_filter_expand_conv, 
+#           "filter_depth_conv": concrete_filter_depth_conv, "filter_project_conv": concrete_filter_project_conv, 
+#           "bias_expand_conv": concrete_bias_expand_conv, "bias_depth_conv": concrete_bias_depth_conv, 
+#           "bias_project_conv": concrete_bias_project_conv}
 # results = Toy(circuit_ir, inputs, args).run() # seems to get stuck at 20% forever
 # print("results: ",results)
