@@ -146,6 +146,19 @@ class ReshapeArgs:
 
 
 @dataclass(frozen=True)
+class FlattenArgs:
+    """Structured view of a FLATTEN term (term.cs = [input, start, end]); end is inclusive."""
+
+    input: Any
+    start: int
+    end: int
+
+    @classmethod
+    def from_term(cls, term: Any) -> "FlattenArgs":
+        return cls(input=term.cs[0], start=int(term.cs[1]), end=int(term.cs[2]))
+
+
+@dataclass(frozen=True)
 class TensorPlaceholderArgs:
     """Structured view of a TENSOR placeholder term (term.cs = [name, shape, secret])."""
 

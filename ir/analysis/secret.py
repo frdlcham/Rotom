@@ -58,6 +58,7 @@ class Secret:
                 | TensorOp.CUMSUM
                 | TensorOp.AVG_POOL2D
                 | TensorOp.RESHAPE
+                | TensorOp.FLATTEN
                 | TensorOp.PERMUTE
                 | TensorOp.INDEX
                 | TensorOp.RESCALE
@@ -136,6 +137,7 @@ class Secret:
                 | TensorOp.CUMSUM
                 | TensorOp.AVG_POOL2D
                 | TensorOp.RESHAPE
+                | TensorOp.FLATTEN
                 | TensorOp.PERMUTE
                 | TensorOp.INDEX
                 | TensorOp.RESCALE

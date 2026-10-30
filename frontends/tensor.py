@@ -58,6 +58,7 @@ class TensorOp(Enum):
         CONV3D: 3D convolution
         POLY_CALL: Polynomial approximation
         RESHAPE: Tensor reshaping
+        FLATTEN: Merge consecutive dimensions
         PERMUTE: Dimension permutation
         INDEX: Tensor indexing
     """
@@ -77,6 +78,7 @@ class TensorOp(Enum):
     CONV3D = "Conv3D"  # 3D convolutions
     POLY_CALL = "PolyCall"  # polynomial approximation call
     RESHAPE = "Reshape"  # tensor reshape
+    FLATTEN = "Flatten"  # merge consecutive dims into one (padded as a whole)
     PERMUTE = "Permute"  # permute dims
     INDEX = "Index"
     RESCALE = "Rescale"  # scale division
@@ -458,6 +460,29 @@ class TensorTerm:
             >>> c = a.reshape(0, {0: 32, 1: 128}, layout="[0:32:1][1:128:1]")  # With layout
         """
         return TensorTerm(TensorOp.RESHAPE, [self, dim, shape], layout)
+
+    def flatten(
+        self, start: int, end: int, layout: Optional[str] = None
+    ) -> "TensorTerm":
+        """Merge dimensions ``start..end`` (inclusive) into a single dimension.
+
+        The merged dimension is padded to a power of 2 as a whole, e.g. flattening
+        [C, 5, 14, 14] over dims 1..3 gives [C, 980], padded to [C, 1024]
+        (instead of [C, 8, 16, 16] = 2048 slots per channel).
+
+        Args:
+            start (int): First dimension to merge
+            end (int): Last dimension to merge (inclusive)
+            layout (str, optional): Tensor layout string for the result
+
+        Returns:
+            TensorTerm: A new tensor term representing the flatten
+
+        Example:
+            >>> b = a.flatten(1, 3)  # [C, T, H, W] -> [C, T*H*W]
+        """
+        assert 0 <= start < end, f"flatten expects start < end, got {start}, {end}"
+        return TensorTerm(TensorOp.FLATTEN, [self, start, end], layout)
 
     def permute(self, dim_map, layout=None):
         """Permute tensor dimensions.

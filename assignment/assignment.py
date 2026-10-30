@@ -32,6 +32,7 @@ from assignment.gen.gen_cast import gen_cast
 from assignment.gen.gen_mean import gen_mean
 from assignment.gen.gen_conv2d import gen_conv2d, gen_conv2d_roll
 from assignment.gen.gen_conv3d import gen_conv3d, gen_depthwise_conv3d
+from assignment.gen.gen_flatten import gen_flatten
 from assignment.gen.gen_index import gen_index
 from assignment.gen.gen_permute import gen_permute
 from assignment.gen.gen_poly_call import gen_poly_call
@@ -43,7 +44,7 @@ from assignment.gen.gen_tensor import gen_tensor
 from assignment.gen.gen_tile import gen_tile
 from assignment.gen.gen_transpose import gen_transpose
 from frontends.tensor import TensorOp, TensorTerm
-from frontends.tensor_args import Conv3dArgs
+from frontends.tensor_args import Conv3dArgs, FlattenArgs
 
 # import layout assignment components
 from ir.analysis.secret import Secret
@@ -206,6 +207,14 @@ class LayoutAssignment:
                     kernels = gen_conv3d(term, cs_kernels[0], cs_shapes)
             case TensorOp.RESHAPE:
                 kernels = gen_reshape(term, cs_kernels[0])
+            case TensorOp.FLATTEN:
+                args = FlattenArgs.from_term(term)
+                kernels = gen_flatten(
+                    term,
+                    cs_kernels[0],
+                    self.shape.shapes[args.input],
+                    self.shape.padded_shapes[args.input],
+                )
             case TensorOp.PERMUTE:
                 kernels = gen_permute(term, cs_kernels[0])
             case TensorOp.RESCALE:
@@ -471,6 +480,7 @@ class LayoutAssignment:
                 | TensorOp.MEAN
                 | TensorOp.PRODUCT
                 | TensorOp.RESHAPE
+                | TensorOp.FLATTEN
                 | TensorOp.PERMUTE
                 | TensorOp.INDEX
                 | TensorOp.TILE

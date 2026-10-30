@@ -121,7 +121,7 @@ class Lower:
                     self.env[term] = lower_split_roll(self.env, term)
                 case KernelOp.TRANSPOSE:
                     self.env[term] = lower_transpose(self.env, term)
-                case KernelOp.RESHAPE:
+                case KernelOp.RESHAPE | KernelOp.FLATTEN:
                     self.env[term] = lower_reshape(self.env, term)
                 case KernelOp.PERMUTE:
                     self.env[term] = lower_permute(self.env, term)

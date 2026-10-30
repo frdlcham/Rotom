@@ -217,6 +217,7 @@ class KernelCost(MatmulCostMixin, ConvCostMixin, RollCostMixin):
                 KernelOp.CS
                 | KernelOp.TRANSPOSE
                 | KernelOp.RESHAPE
+                | KernelOp.FLATTEN
                 | KernelOp.PERMUTE
                 | KernelOp.INDEX
                 | KernelOp.SELECT

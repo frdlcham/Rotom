@@ -19,10 +19,11 @@ from frontends.tensor import TensorOp
 from frontends.tensor_args import (
     Conv2dArgs,
     Conv3dArgs,
+    FlattenArgs,
     ReshapeArgs,
     TensorPlaceholderArgs,
 )
-from util.util import round_to_ceiling_power_of_2
+from util.util import prod, round_to_ceiling_power_of_2
 
 
 def _avg_pool_out_hw(
@@ -191,6 +192,18 @@ class Shape:
                 return a_shape + [
                     round_to_ceiling_power_of_2(s) for s in args.shape.values()
                 ]
+            case TensorOp.FLATTEN:
+                args = FlattenArgs.from_term(term)
+                a_shape = copy(self.padded_shapes[args.input])
+                logical_a = self.get_shape(args.input)
+                # Group first, then pad: use the product of the *logical* sizes
+                # (5*14*14 = 980 -> 1024), not of the padded sizes (8*16*16 = 2048).
+                grouped = prod(logical_a[args.start : args.end + 1])
+                return (
+                    a_shape[: args.start]
+                    + [round_to_ceiling_power_of_2(grouped)]
+                    + a_shape[args.end + 1 :]
+                )
             case TensorOp.CONV2D:
                 args = Conv2dArgs.from_term(term)
                 # Convolution semantics use the *logical* input spatial sizes; tensor eval
@@ -485,6 +498,14 @@ class Shape:
                     shape_map[k] = v
                 new_shape = [shape_map[k] for k in sorted(shape_map.keys())]
                 return new_shape
+            case TensorOp.FLATTEN:
+                args = FlattenArgs.from_term(term)
+                a_shape = copy(self.get_shape(args.input))
+                return (
+                    a_shape[: args.start]
+                    + [prod(a_shape[args.start : args.end + 1])]
+                    + a_shape[args.end + 1 :]
+                )
             case TensorOp.PERMUTE:
                 a = term.cs[0]
                 a_shape = copy(self.get_shape(a))

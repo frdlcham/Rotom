@@ -72,6 +72,7 @@ class KernelOp(Enum):
     COMPACT = "COMPACT"
     TRANSPOSE = "TRANSPOSE"
     RESHAPE = "RESHAPE"
+    FLATTEN = "FLATTEN"
     PERMUTE = "PERMUTE"
     # index
     INDEX = "INDEX"

@@ -525,6 +525,25 @@ class TensorEvaluator:
                     shape[k] = self._round_to_ceiling_power_of_2(v)
                 shape_list = [shape[k] for k in sorted(shape.keys())]
                 return tensor.reshape(shape_list)
+            case "Flatten":
+                from ir.analysis.shape import Shape
+
+                from .tensor_args import FlattenArgs
+
+                args = FlattenArgs.from_term(term)
+                # Trim any power-of-2 padding first so the merged axis is the
+                # row-major flatten of the *logical* dims (padding stays at the end).
+                shape_an = Shape(args.input)
+                shape_an.run()
+                logical = shape_an.shapes[args.input]
+                tensor = np.asarray(env[args.input])
+                tensor = tensor[tuple(slice(0, int(s)) for s in logical)]
+                new_shape = (
+                    list(tensor.shape[: args.start])
+                    + [-1]
+                    + list(tensor.shape[args.end + 1 :])
+                )
+                return tensor.reshape(new_shape)
             case "Permute":
                 tensor = env[term.cs[0]]
                 return np.moveaxis(tensor, term.cs[1].keys(), term.cs[1].values())
