@@ -72,7 +72,7 @@ filter_depth_conv = TensorTerm.Tensor("filter_depth_conv", [filter_shape_2nd_con
 bias_depth_conv = TensorTerm.Tensor("bias_depth_conv", [C_out_2, T, H//2, W//2], False)  # bias plaintext vector
 
 filter_project_conv = TensorTerm.Tensor("filter_project_conv", [filter_shape_3rd_conv[0], filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4]], False)  # filter plaintext matrix
-bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T, H, W], False)  # bias plaintext vector
+bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T, H//2, W//2], False)  # bias plaintext vector
 
 output_expand_conv = TensorTerm.conv3d(input, filter_expand_conv, stride=STRIDE_conv_1, padding="same") + bias_expand_conv
 output_depth_conv = TensorTerm.depthwise_conv3d(output_expand_conv, filter_depth_conv, STRIDE_conv_2, "same") + bias_depth_conv
