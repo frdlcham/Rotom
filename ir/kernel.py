@@ -29,7 +29,7 @@ class KernelOp(Enum):
     Operation Categories:
         Tensor ops: TENSOR, CS, CONST, ADD, SUB, MUL, SUM, MEAN, PRODUCT
         Matrix ops: MATMUL, BLOCK_MATMUL, BSGS_MATMUL, STRASSEN_MATMUL
-        Convolution: CONV2D, CONV2D_ROLL
+        Convolution: CONV2D, CONV2D_ROLL, CONV3D, DEPTHWISE_CONV3D
         Polynomial: POLY
         Conversions: CONVERSION
         Replications: REPLICATE
@@ -56,6 +56,7 @@ class KernelOp(Enum):
     CONV2D = "CONV2D"
     CONV2D_ROLL = "CONV2D_ROLL"
     CONV3D = "CONV3D"
+    DEPTHWISE_CONV3D = "DEPTHWISE_CONV3D"
     # poly
     POLY = "POLY"
     POLY_CALL = "POLY_CALL"

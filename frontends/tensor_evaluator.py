@@ -315,6 +315,48 @@ class TensorEvaluator:
                             )
         return out
 
+    @staticmethod
+    def _eval_depthwise_conv3d(
+        input_tensor: np.ndarray,
+        filter_tensor: np.ndarray,
+        strides: Any,
+        padding: str,
+    ) -> np.ndarray:
+        # Input: [C, D, H, W]; filter: [C, Kd, Kh, Kw]
+        from .tensor_args import Conv3dArgs
+
+        x = np.asarray(input_tensor, dtype=np.float64)
+        f = np.asarray(filter_tensor, dtype=np.float64)
+        if x.ndim != 4 or f.ndim != 4 or f.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"depthwise Conv3D expects input [C,D,H,W] and filter [C,Kd,Kh,Kw], "
+                f"got {x.shape} and {f.shape}"
+            )
+        in_dhw, k_dhw = x.shape[1:], f.shape[1:]
+        out_dhw, front = Conv3dArgs.depthwise_geometry(
+            in_dhw, k_dhw, strides, padding
+        )
+        # Zero-pad so every window read below is in range.
+        pads = [(0, 0)] + [
+            (p, max(0, (o - 1) * s + k - i - p))
+            for i, k, s, o, p in zip(in_dhw, k_dhw, strides, out_dhw, front)
+        ]
+        x = np.pad(x, pads)
+        sd, sh, sw = strides
+        od, oh, ow = out_dhw
+        out = np.zeros((x.shape[0], od, oh, ow))
+        for i in range(k_dhw[0]):
+            for j in range(k_dhw[1]):
+                for k in range(k_dhw[2]):
+                    window = x[
+                        :,
+                        i : i + (od - 1) * sd + 1 : sd,
+                        j : j + (oh - 1) * sh + 1 : sh,
+                        k : k + (ow - 1) * sw + 1 : sw,
+                    ]
+                    out += f[:, i, j, k, None, None, None] * window
+        return out
+
     def _eval_poly(
         self, x: np.ndarray, func: Any, inputs: Dict[str, Any]
     ) -> np.ndarray:
@@ -443,6 +485,10 @@ class TensorEvaluator:
                 from .tensor_args import Conv3dArgs
 
                 args = Conv3dArgs.from_term(term)
+                if args.depthwise:
+                    return self._eval_depthwise_conv3d(
+                        env[args.input], env[args.filter], args.stride, args.padding
+                    )
                 return self._eval_conv3d(
                     env[args.input], env[args.filter], args.stride, args.padding
                 )

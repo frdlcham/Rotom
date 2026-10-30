@@ -298,3 +298,67 @@ class TestConvolution3D:
         }
         tensor_ir = self._create_conv3d(d, h, w, c_in, c_out, k, k, k, 1, "same")
         self._run_test_case(tensor_ir, inputs, args, backend)
+
+
+def _naive_depthwise_conv3d(inp, flt, strides, padding) -> np.ndarray:
+    """Per-voxel reference with explicit bounds checks instead of padding the input."""
+    c, *in_dhw = inp.shape
+    k_dhw = flt.shape[1:]
+    out_dhw, front = [], []
+    for i, k, s in zip(in_dhw, k_dhw, strides):
+        if padding == "valid":
+            out_dhw.append((i - k) // s + 1)
+            front.append(0)
+        elif s == 1:  # same, stride 1: extra pad goes at the back
+            out_dhw.append(i)
+            front.append((k - 1) // 2)
+        else:  # same, stride > 1: symmetric k // 2
+            out_dhw.append((i + 2 * (k // 2) - k) // s + 1)
+            front.append(k // 2)
+    out = np.zeros([c] + out_dhw)
+    for idx in np.ndindex(*out.shape):
+        ch, o = idx[0], idx[1:]
+        for tap in np.ndindex(*k_dhw):
+            src = [o[a] * strides[a] + tap[a] - front[a] for a in range(3)]
+            if all(0 <= src[a] < in_dhw[a] for a in range(3)):
+                out[idx] += inp[(ch, *src)] * flt[(ch, *tap)]
+    return out
+
+
+DEPTHWISE_CASES = [
+    # (input [C, D, H, W], filter [Kd, Kh, Kw], stride, padding, input layout)
+    ((3, 5, 7, 6), (5, 3, 3), (1, 2, 2), "same", None),
+    ((4, 4, 6, 6), (2, 3, 2), (1, 1, 1), "same", None),
+    ((2, 6, 9, 9), (3, 3, 3), (2, 2, 2), "valid", None),
+    ((4, 4, 4, 4), (3, 3, 3), (1, 2, 2), "same", "[0:2:2][1:4:1][2:4:1][G:2][3:4:1][0:2:1]"),
+]
+
+
+@pytest.mark.parametrize("shape,k,stride,padding,layout", DEPTHWISE_CASES)
+def test_depthwise_conv3d_eval_matches_naive(shape, k, stride, padding, layout):
+    rng = np.random.default_rng(7)
+    x = rng.normal(size=shape)
+    f = rng.normal(size=(shape[0],) + k)
+    a = TensorTerm.Tensor("a", list(shape), True)
+    b = TensorTerm.Tensor("b", [shape[0], *k], False)
+    got = TensorTerm.depthwise_conv3d(a, b, stride, padding).eval({"a": x, "b": f})
+    np.testing.assert_allclose(got, _naive_depthwise_conv3d(x, f, stride, padding))
+
+
+@pytest.mark.parametrize("shape,k,stride,padding,layout", DEPTHWISE_CASES)
+def test_depthwise_conv3d_end_to_end(backend, shape, k, stride, padding, layout):
+    args = get_default_args()
+    args.n = 1024
+    args.rolls = True
+    args.conv_roll = False
+    args.benchmark = f"dw_conv3d_{abs(hash((shape, k, stride, padding, layout))) % 10**8}"
+
+    a = TensorTerm.Tensor("a", list(shape), True, layout=layout)
+    b = TensorTerm.Tensor("b", [shape[0], *k], False)
+    y = TensorTerm.depthwise_conv3d(a, b, stride, padding)
+    rng = np.random.default_rng(11)
+    inputs = {"a": rng.normal(size=shape), "b": rng.normal(size=(shape[0],) + k)}
+
+    expected = y.eval(inputs)
+    results, kernel = run_compiler_and_backend(y, inputs, args, backend)
+    assert_results_equal(apply_layout(expected, kernel.layout), results, backend)

@@ -234,6 +234,16 @@ class Shape:
                     round_to_ceiling_power_of_2(w_o),
                 ]
                 return c_shape
+            case TensorOp.CONV3D if Conv3dArgs.from_term(term).depthwise:
+                args = Conv3dArgs.from_term(term)
+                logical_a = self.get_shape(args.input)
+                logical_b = self.get_shape(args.filter)
+                out_dhw, _ = Conv3dArgs.depthwise_geometry(
+                    logical_a[1:], logical_b[1:], args.stride, args.padding
+                )
+                return [round_to_ceiling_power_of_2(logical_a[0])] + [
+                    round_to_ceiling_power_of_2(o) for o in out_dhw
+                ]
             case TensorOp.CONV3D:
                 args = Conv3dArgs.from_term(term)
                 # Use logical input spatial sizes; then round the output spatial dims to p2.
@@ -415,6 +425,19 @@ class Shape:
                     raise NotImplementedError(f"unknown padding: {padding}")
                 c_shape = [c_o, h_o, w_o]
                 return c_shape
+            case TensorOp.CONV3D if Conv3dArgs.from_term(term).depthwise:
+                args = Conv3dArgs.from_term(term)
+                a_shape = self.get_shape(args.input)
+                b_shape = self.get_shape(args.filter)
+                if len(a_shape) != 4 or len(b_shape) != 4 or a_shape[0] != b_shape[0]:
+                    raise ValueError(
+                        "depthwise Conv3D expects input [C,D,H,W] and filter "
+                        f"[C,Kd,Kh,Kw], got {a_shape} and {b_shape}"
+                    )
+                out_dhw, _ = Conv3dArgs.depthwise_geometry(
+                    a_shape[1:], b_shape[1:], args.stride, args.padding
+                )
+                return [a_shape[0]] + out_dhw
             case TensorOp.CONV3D:
                 args = Conv3dArgs.from_term(term)
                 a = args.input

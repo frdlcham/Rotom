@@ -184,7 +184,8 @@ class TensorTerm:
                     self._str_cache = f"(conv2d {str(args.input)} {str(args.filter)})"
                 case TensorOp.CONV3D:
                     args = Conv3dArgs.from_term(self)
-                    self._str_cache = f"(conv3d {str(args.input)} {str(args.filter)})"
+                    name = "depthwise_conv3d" if args.depthwise else "conv3d"
+                    self._str_cache = f"({name} {str(args.input)} {str(args.filter)})"
                 case _:
                     self._str_cache = f"({self.op} {cs})"
         return self._str_cache
@@ -586,6 +587,40 @@ class TensorTerm:
         - `padding` is "valid" or "same".
         """
         return TensorTerm(TensorOp.CONV3D, [a, b, stride, padding], layout)
+
+    @staticmethod
+    def depthwise_conv3d(
+        a: "TensorTerm",
+        b: "TensorTerm",
+        stride: int | tuple[int, int, int],
+        padding: str,
+        layout: Optional[str] = None,
+    ) -> "TensorTerm":
+        """Create a depthwise 3D convolution (channel multiplier 1).
+
+        Each channel is convolved with its own filter; channels never mix.
+
+        Conventions:
+        - Input tensor shape: [C, D_in, H_in, W_in] (e.g. D = time for video)
+        - Filter tensor shape: [C, K_d, K_h, K_w]
+        - Output tensor shape: [C, D_out, H_out, W_out]
+        - `stride` is an int (all axes) or a per-axis (s_d, s_h, s_w) tuple of powers of 2.
+        - `padding` is "valid" or "same" (per axis, as in `conv3d`).
+
+        Example:
+            >>> # 5-frame video, stride 2 over H/W only
+            >>> y = TensorTerm.depthwise_conv3d(x, w, (1, 2, 2), "same")
+        """
+        if isinstance(stride, int):
+            stride = (stride, stride, stride)
+        stride = tuple(int(s) for s in stride)
+        if len(stride) != 3 or any(s <= 0 or s & (s - 1) for s in stride):
+            raise ValueError(
+                f"depthwise_conv3d stride must be 3 powers of 2, got {stride}"
+            )
+        return TensorTerm(
+            TensorOp.CONV3D, [a, b, stride, padding, "depthwise"], layout
+        )
 
     @staticmethod
     def concat(

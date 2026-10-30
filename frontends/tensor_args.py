@@ -74,12 +74,16 @@ class Conv3dArgs:
 
     After assignment, term.cs may have computed padding at index 4; for Conv3D this is
     `[pad_front, pad_back, pad_top, pad_bottom, pad_left, pad_right]`.
+
+    Depthwise Conv3D terms carry ``"depthwise"`` at index 4
+    (term.cs = [input, filter, (s_d, s_h, s_w), padding, "depthwise"]).
     """
 
     input: Any
     filter: Any  # noqa: A003
-    stride: int
+    stride: Any  # int for dense Conv3D, (s_d, s_h, s_w) for depthwise
     padding: str
+    depthwise: bool = False
 
     @classmethod
     def from_term(cls, term: Any) -> "Conv3dArgs":
@@ -88,7 +92,37 @@ class Conv3dArgs:
             filter=term.cs[1],
             stride=term.cs[2],
             padding=term.cs[3],
+            depthwise=len(term.cs) > 4 and term.cs[4] == "depthwise",
         )
+
+    @staticmethod
+    def depthwise_geometry(in_dhw, k_dhw, strides, padding):
+        """Per-axis output sizes and leading pads for depthwise Conv3D.
+
+        Uses the same per-axis convention as dense Conv3D: ``same`` with stride 1
+        keeps the size (TF-style split, extra pad at the back); ``same`` with
+        stride > 1 pads ``k // 2`` on both sides; ``valid`` pads nothing.
+
+        Returns:
+            (out_dhw, pad_front_dhw) as lists of 3 ints.
+        """
+        out, front = [], []
+        for i, k, s in zip(in_dhw, k_dhw, strides):
+            if padding == "valid":
+                p = 0
+                o = (i - k) // s + 1
+            elif padding == "same":
+                if s == 1:
+                    p = (k - 1) // 2
+                    o = i
+                else:
+                    p = k // 2
+                    o = (i + 2 * p - k) // s + 1
+            else:
+                raise NotImplementedError(f"unknown padding: {padding}")
+            out.append(int(o))
+            front.append(int(p))
+        return out, front
 
     @staticmethod
     def get_computed_padding(term: Any) -> Optional[List[int]]:

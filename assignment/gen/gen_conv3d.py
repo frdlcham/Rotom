@@ -210,3 +210,88 @@ def gen_conv3d(term, cs_kernels, shapes):
         output_kernels.add(kernel)
 
     return output_kernels
+
+
+def depthwise_conv3d_filter_layout(b_term, out_layout, k_dhw):
+    """Public filter layout for depthwise Conv3D: one ciphertext group per tap.
+
+    Ciphertext index = tap_index * out_layout.num_ct() + out_ct_index, where
+    ``tap_index`` enumerates (kd, kh, kw) row-major. Within a ciphertext each slot
+    holds the weight of that slot's output channel (spatial dims are replicated).
+    """
+    tap_dims = [Dim(i + 1, k, 1) for i, k in enumerate(k_dhw) if k > 1]
+    dims = []
+    for d in out_layout.get_dims():
+        if d.dim_type == DimType.EMPTY:
+            dims.append(Dim(None, d.extent, 1, DimType.EMPTY))
+        elif d.dim == 0:
+            dims.append(Dim(0, d.extent, d.stride))
+        else:
+            dims.append(Dim(None, d.extent, 1))
+    layout = Layout(b_term, [], tap_dims + dims, out_layout.n, False)
+    # Keep tap ct dims outermost so the ct index formula above holds.
+    layout.ct_dims = tap_dims + [d for d in layout.ct_dims if d not in tap_dims]
+    return layout
+
+
+def _axis_extent(layout, axis):
+    extent = 1
+    for d in layout.get_dims():
+        if d.dim == axis:
+            extent *= d.extent
+    return extent
+
+
+def gen_depthwise_conv3d(term, cs_kernels, shapes):
+    """Depthwise Conv3D: output keeps the input packing.
+
+    Each spatial dim ``[d:E]`` becomes ``[d:E_out][G:E/E_out]`` (split axes shrink
+    from their innermost part). When ``E/E_out`` equals the stride, output voxel
+    ``o`` sits where input voxel ``o * stride`` sat, so every filter tap is a
+    single uniform rotation per ciphertext (plus boundary masks). Lowering is
+    correct for any resulting layout; alignment only affects rotation count.
+    """
+    args = Conv3dArgs.from_term(term)
+    a_shape, b_shape = shapes[0], shapes[1]
+    out_dhw, _ = Conv3dArgs.depthwise_geometry(
+        a_shape[1:], b_shape[1:], args.stride, args.padding
+    )
+    out_p2 = {d + 1: round_to_ceiling_power_of_2(o) for d, o in enumerate(out_dhw)}
+
+    output_kernels = set()
+    for a_kernel in cs_kernels:
+        layout = a_kernel.layout
+        if layout.rolls:
+            continue
+        # Shrink each spatial axis to its output extent, innermost part first,
+        # leaving a gap of the removed factor after the shrunk part. An axis may
+        # be split over several Dims (e.g. across ciphertexts and slots).
+        shrink = {
+            axis: _axis_extent(layout, axis) // out_p2[axis] for axis in (1, 2, 3)
+        }
+        new_extent = {}
+        for d in reversed(layout.get_dims()):
+            if d.dim in (1, 2, 3):
+                g = min(shrink[d.dim], d.extent)
+                shrink[d.dim] //= g
+                new_extent[id(d)] = (d.extent // g, g)
+        dims = []
+        inner = {}
+        for d in reversed(layout.get_dims()):
+            if d.dim in (1, 2, 3):
+                e, g = new_extent[id(d)]
+                if g > 1:
+                    dims.append(Dim(None, g, 1, DimType.EMPTY))
+                if e > 1:
+                    dims.append(Dim(d.dim, e, inner.get(d.dim, 1)))
+                    inner[d.dim] = inner.get(d.dim, 1) * e
+            else:
+                dims.append(copy(d))
+        dims.reverse()
+        out_layout = Layout(term, [], dims, layout.n, layout.secret)
+        b_layout = depthwise_conv3d_filter_layout(args.filter, out_layout, b_shape[1:])
+        b_kernel = Kernel(KernelOp.TENSOR, [], b_layout)
+        output_kernels.add(
+            Kernel(KernelOp.DEPTHWISE_CONV3D, [a_kernel, b_kernel], out_layout)
+        )
+    return output_kernels
