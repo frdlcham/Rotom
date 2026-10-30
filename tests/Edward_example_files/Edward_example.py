@@ -12,9 +12,9 @@ from lower.lower import Lower
 
 # SHAPES - doesn't seem to matter if the dimensions are powers of 2 or not?
 # layout always works, actual conv always fails with a mismatch between toy and the expected output
-# T = 5
-# H = 28
-# W = 28
+T = 5
+H = 28
+W = 28
 
 # C_in_1 = 32 # channels input to first conv
 # C_out_1 = 184
@@ -26,9 +26,9 @@ from lower.lower import Lower
 # C_out_3 = 56
 
 # T, H, and W, padded to powers of 2
-T = 8
-H = 32
-W = 32
+# T = 8
+# H = 32
+# W = 32
 
 # Channels padded to powers of 2
 C_in_1 = 32 # channels input to first conv
