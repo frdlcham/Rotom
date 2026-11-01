@@ -6,13 +6,14 @@ FLATTEN merges consecutive dims and pads the merged dim as a whole
 """
 
 import numpy as np
-import pytest
 
 from assignment.assignment import LayoutAssignment
 from frontends.tensor import TensorTerm
+from ir.kernel import KernelOp
 from ir.analysis.shape import Shape
 from tests.conftest import assert_results_equal, run_compiler_and_backend
 from tests.test_util import get_default_args
+from util.flatten_repack import flatten_repack_plan_for_kernel
 from util.layout_util import apply_layout
 
 
@@ -65,9 +66,43 @@ class TestFlattenToy:
         f = TensorTerm.Tensor("f", [c_out, c_in], False)
         self._run(f @ x.flatten(1, 3), inputs, args, backend)
 
-    def test_flatten_padded_inner_dim_not_supported(self):
+    def test_flatten_padded_inner_dims(self, backend):
+        """Padded inner dims (6 stored as 8) are repacked; spans multiple cts."""
+        args = get_default_args()
+        args.n = 256
+        rng = np.random.default_rng(0)
+        inputs = {"x": rng.normal(size=(2, 3, 6, 6))}
+        x = TensorTerm.Tensor("x", [2, 3, 6, 6], True)
+        self._run(x.flatten(1, 3), inputs, args, backend)
+
+    def test_flatten_padded_keeps_trailing_dims(self, backend):
+        args = get_default_args()
+        args.n = 256
+        rng = np.random.default_rng(0)
+        inputs = {"x": rng.normal(size=(3, 5, 6, 7))}
+        x = TensorTerm.Tensor("x", [3, 5, 6, 7], True)
+        self._run(x.flatten(0, 1), inputs, args, backend)
+
+    def test_flatten_padded_then_pointwise_matmul(self, backend):
+        args = get_default_args()
+        args.n = 256
+        c_in, c_out = 2, 4
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=(c_in, 3, 6, 6)),
+            "f": rng.normal(size=(c_out, c_in)),
+        }
+        x = TensorTerm.Tensor("x", [c_in, 3, 6, 6], True)
+        f = TensorTerm.Tensor("f", [c_out, c_in], False)
+        self._run(f @ x.flatten(1, 3), inputs, args, backend)
+
+    def test_flatten_padded_uses_staged_repack(self):
+        """[4, 5, 14, 14] -> [4, 980]: staged per dim, far fewer rotations than one shot."""
         args = get_default_args()
         args.n = 4096
         x = TensorTerm.Tensor("x", [4, 5, 14, 14], True)
-        with pytest.raises(NotImplementedError, match="repacking"):
-            LayoutAssignment(x.flatten(1, 3), args).run()
+        kernel = LayoutAssignment(x.flatten(1, 3), args).run()
+        assert kernel.op == KernelOp.FLATTEN_REPACK
+        plan = flatten_repack_plan_for_kernel(kernel)
+        assert len(plan.stages) > 1
+        assert plan.ops()["rot"] < 5 * 14

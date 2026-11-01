@@ -73,6 +73,7 @@ class KernelOp(Enum):
     TRANSPOSE = "TRANSPOSE"
     RESHAPE = "RESHAPE"
     FLATTEN = "FLATTEN"
+    FLATTEN_REPACK = "FLATTEN_REPACK"
     PERMUTE = "PERMUTE"
     # index
     INDEX = "INDEX"
@@ -220,6 +221,15 @@ class Kernel:
             ):
                 res = []
                 _res, _seen = self.cs[1].helper_post_order(seen)
+                res += _res
+                seen |= _seen
+                seen.add(self)
+                res.append(self)
+                return res, seen
+            case KernelOp.FLATTEN_REPACK:
+                # cs[1] is the logical input shape, not a kernel
+                res = []
+                _res, _seen = self.cs[0].helper_post_order(seen)
                 res += _res
                 seen |= _seen
                 seen.add(self)

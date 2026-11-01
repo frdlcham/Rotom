@@ -27,6 +27,7 @@ from lower.lower_conv2d_roll import lower_conv2d_roll
 from lower.lower_conv3d import lower_conv3d, lower_depthwise_conv3d
 from lower.lower_conversion import lower_conversion
 from lower.lower_cs_pack import lower_cs_pack
+from lower.lower_flatten import lower_flatten_repack
 from lower.lower_index import lower_index
 from lower.lower_mask_tensor import lower_punctured_tensor
 from lower.lower_matmul import lower_bsgs_matmul, lower_matmul
@@ -123,6 +124,8 @@ class Lower:
                     self.env[term] = lower_transpose(self.env, term)
                 case KernelOp.RESHAPE | KernelOp.FLATTEN:
                     self.env[term] = lower_reshape(self.env, term)
+                case KernelOp.FLATTEN_REPACK:
+                    self.env[term] = lower_flatten_repack(self.env, term)
                 case KernelOp.PERMUTE:
                     self.env[term] = lower_permute(self.env, term)
                 case KernelOp.COMPACT:

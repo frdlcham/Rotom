@@ -91,7 +91,11 @@ def apply_roll(term, kernel, roll):
 
 def calculate_padding(input_shape, filter_shape, stride, padding):
     # Input shape: [C_in, H_in, W_in]
-    H_in, W_in = input_shape[1], input_shape[2]
+    H_in = input_shape[1]
+    if (len(input_shape) < 3):
+        W_in = 1
+    else:
+        W_in = input_shape[2]
     # Filter shape: [C_out, C_in, H_f, W_f]
     K_h, K_w = filter_shape[2], filter_shape[3]
     S_h, S_w = stride, stride
@@ -308,7 +312,10 @@ def add_replicated_dimensions(a_shape, b_shape):
 
     # Replicate output channels
     if c_out > 1:
-        replicated_dims.append(Dim(None, c_out, c_in * a_shape[1] * a_shape[2]))
+        if (len(a_shape) < 3):
+            replicated_dims.append(Dim(None, c_out, c_in * a_shape[1]))
+        else:
+            replicated_dims.append(Dim(None, c_out, c_in * a_shape[1] * a_shape[2]))
         b_dims.append(Dim(0, c_out, 1))
 
     # Replicate spatial dimensions
@@ -354,8 +361,12 @@ def _conv2d_output_dims_zip(a_dims, b_dims, h_o_p2, w_o_p2, stride):
     return output_dims
 
 
-def _materialized_tensor_shape(output_layout):
-    """Product of extents per logical dim index (0,1,2), ignoring EMPTY / None dim."""
+def _materialized_tensor_shape(output_layout, ndim=None):
+    """Product of extents per logical dim index (0,1,2), ignoring EMPTY / None dim.
+
+    Size-1 tensor dims never appear in a layout, so missing dims (including
+    trailing ones up to ``ndim``) are reported as 1.
+    """
     shape_map = {}
     for d in output_layout.get_dims():
         if d.dim_type == DimType.EMPTY or d.dim is None:
@@ -364,9 +375,9 @@ def _materialized_tensor_shape(output_layout):
             shape_map[d.dim] *= d.extent
         else:
             shape_map[d.dim] = d.extent
-    if not shape_map:
-        return []
-    return [shape_map.get(i, 1) for i in range(max(shape_map.keys()) + 1)]
+    if ndim is None:
+        ndim = max(shape_map.keys()) + 1 if shape_map else 0
+    return [shape_map.get(i, 1) for i in range(ndim)]
 
 
 def gen_conv2d(term, cs_kernels, shapes):
@@ -397,6 +408,8 @@ def gen_conv2d(term, cs_kernels, shapes):
     # Step 4: Create the layout and kernel
 
     a_shape = shapes[0]
+    if len(a_shape) == 2:
+        a_shape = [a_shape[0], a_shape[1], 1] # treat [C, H] as [C, H, 1]
     b_shape = shapes[1]
 
     args = Conv2dArgs.from_term(term)
@@ -462,7 +475,7 @@ def gen_conv2d(term, cs_kernels, shapes):
         )
 
         expected = [b_shape[0], h_o_p2, w_o_p2]
-        kernel_shape = _materialized_tensor_shape(output_layout)
+        kernel_shape = _materialized_tensor_shape(output_layout, len(expected))
         if kernel_shape != expected:
             continue
 
