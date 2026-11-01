@@ -93,11 +93,11 @@ output_project_conv_2d = TensorTerm.conv2d(flattened_output_depth_conv, filter_p
 
 # Run layout assignment for last conv
 # Since the other convs are in the input of last conv? unsure if this works
-args = argparse.Namespace(n=32768, rolls=True, backend="toy")
+args = argparse.Namespace(n=32768, rolls=False, backend="toy") # put rolls to false because otherwise there's some issue with the optimization pass
 
-kernel = LayoutAssignment(output_project_conv, args).run()
+# kernel = LayoutAssignment(output_project_conv, args).run()
 
-# kernel = LayoutAssignment(output_project_conv_2d, args).run()
+kernel = LayoutAssignment(output_project_conv_2d, args).run()
 
 # All layouts, inputs first and output last
 for k in kernel.post_order():
