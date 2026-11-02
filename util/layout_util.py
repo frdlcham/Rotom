@@ -54,6 +54,7 @@ def merge_dims(dims, in_roll):
             continue
         if (
             base_dim.dim == next_dim.dim
+            and base_dim.group == next_dim.group
             and base_dim.dim_type == next_dim.dim_type
             and base_dim.stride == next_dim.extent * next_dim.stride
         ):
@@ -784,6 +785,21 @@ def _get_apply_layout_plan(layout, pt_tensor_ndim: int, *, layout_len: int) -> d
                     indices_map[dim.dim] = add_vec(indices_map[dim.dim], dim_indices[i])
                 else:
                     indices_map[dim.dim] = dim_indices[i]
+
+        # group dims: unravel the row-major group position into the grouped
+        # dims; positions past the logical elements are padding
+        for dim in dims:
+            if dim.is_group and dim.dim in indices_map:
+                positions = indices_map.pop(dim.dim)
+                group_size = int(prod(dim.group))
+                for k, d in enumerate(dim.dim):
+                    assert d not in indices_map, f"dim {d} is grouped and ungrouped"
+                    inner = int(prod(dim.group[k + 1 :]))
+                    indices_map[d] = [
+                        None if p is None or p >= group_size
+                        else (p // inner) % dim.group[k]
+                        for p in positions
+                    ]
 
         for i, dim in enumerate(dims):
             # used for adding gap slots into layout

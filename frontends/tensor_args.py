@@ -159,6 +159,30 @@ class FlattenArgs:
 
 
 @dataclass(frozen=True)
+class GroupPadArgs:
+    """Structured view of a GROUP_PAD term (term.cs = [input, start, end, extent]).
+
+    ``end`` is inclusive; ``extent`` is the padded group extent, or None for the
+    smallest power of 2 that holds the grouped elements.
+    """
+
+    input: Any
+    start: int
+    end: int
+    extent: Optional[int]
+
+    @classmethod
+    def from_term(cls, term: Any) -> "GroupPadArgs":
+        extent = term.cs[3]
+        return cls(
+            input=term.cs[0],
+            start=int(term.cs[1]),
+            end=int(term.cs[2]),
+            extent=int(extent) if extent is not None else None,
+        )
+
+
+@dataclass(frozen=True)
 class TensorPlaceholderArgs:
     """Structured view of a TENSOR placeholder term (term.cs = [name, shape, secret])."""
 

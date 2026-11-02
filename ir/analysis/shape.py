@@ -20,6 +20,7 @@ from frontends.tensor_args import (
     Conv2dArgs,
     Conv3dArgs,
     FlattenArgs,
+    GroupPadArgs,
     ReshapeArgs,
     TensorPlaceholderArgs,
 )
@@ -202,6 +203,17 @@ class Shape:
                 return (
                     a_shape[: args.start]
                     + [round_to_ceiling_power_of_2(grouped)]
+                    + a_shape[args.end + 1 :]
+                )
+            case TensorOp.GROUP_PAD:
+                # The grouped dims are padded as a whole by the layout's group
+                # dim, so each of them keeps its logical extent here.
+                args = GroupPadArgs.from_term(term)
+                a_shape = copy(self.padded_shapes[args.input])
+                logical_a = self.get_shape(args.input)
+                return (
+                    a_shape[: args.start]
+                    + logical_a[args.start : args.end + 1]
                     + a_shape[args.end + 1 :]
                 )
             case TensorOp.CONV2D:
@@ -504,6 +516,8 @@ class Shape:
                     shape_map[k] = v
                 new_shape = [shape_map[k] for k in sorted(shape_map.keys())]
                 return new_shape
+            case TensorOp.GROUP_PAD:
+                return copy(self.get_shape(term.cs[0]))
             case TensorOp.FLATTEN:
                 args = FlattenArgs.from_term(term)
                 a_shape = copy(self.get_shape(args.input))

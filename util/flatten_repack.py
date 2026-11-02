@@ -15,6 +15,10 @@ the shift is applied one tensor dim at a time, innermost merged dim first.
 That needs ~sum(extents) rotations instead of ~prod(extents) for a single
 stage. If staging is not possible (rolls, replication, collisions), a single
 stage moves every element directly.
+
+The same plan also implements GROUP_PAD, which keeps the tensor shape but moves
+the elements of dims ``start..end`` into one group dim padded as a whole (see
+``Dim.group_dim``).
 """
 
 from dataclasses import dataclass
@@ -103,7 +107,7 @@ def _fit_per_dim_shifts(in_idx, delta, logical_shape):
     return c, g
 
 
-def _stage_positions(in_idx, src, dst, logical_shape, start, end):
+def _stage_positions(in_idx, src, dst, logical_shape, start, end, n):
     """List of (from_pos, to_pos) global slot positions, one pair per stage."""
     one_shot = [(src, dst)]
     fit = _fit_per_dim_shifts(in_idx, dst - src, logical_shape)
@@ -113,19 +117,26 @@ def _stage_positions(in_idx, src, dst, logical_shape, start, end):
 
     merged = list(range(end, start - 1, -1))
     order = merged + [k for k in reversed(range(len(logical_shape))) if k not in merged]
-    stages = []
-    cur = src
+    positions = [src]
     for i, k in enumerate(order):
         step = g[k][in_idx[:, k]] + (c if i == 0 else 0)
         if not step.any():
             continue
-        nxt = cur + step
-        if (nxt < 0).any() or np.unique(nxt).size != nxt.size:
+        nxt = positions[-1] + step
+        if np.unique(nxt).size != nxt.size:
             return one_shot
-        stages.append((cur, nxt))
-        cur = nxt
-    assert np.array_equal(cur, dst)
-    return stages
+        positions.append(nxt)
+    assert np.array_equal(positions[-1], dst)
+
+    # Intermediate positions may be negative (e.g. a dim shifted left before
+    # the dims that move it right). Offsetting them by whole ciphertexts keeps
+    # every rotation amount and only renumbers the temporary ciphertexts.
+    if len(positions) > 2:
+        lo = min(int(p.min()) for p in positions[1:-1])
+        if lo < 0:
+            offset = -(lo // n) * n
+            positions[1:-1] = [p + offset for p in positions[1:-1]]
+    return list(zip(positions[:-1], positions[1:]))
 
 
 def _stage_moves(from_pos, to_pos, occupied, n):
@@ -158,6 +169,37 @@ def _occupied(pos, num_ct, n):
 _PLAN_CACHE = {}
 
 
+def _source_positions(in_layout, logical_shape):
+    """(first input slot holding each logical element, occupied input slots)."""
+    in_slots = _slot_indices(in_layout, len(logical_shape))
+    in_valid = _valid(in_slots, logical_shape)
+    in_pos = np.flatnonzero(in_valid.reshape(-1))
+    in_lin = np.ravel_multi_index(
+        tuple(in_slots.reshape(-1, len(logical_shape))[in_pos].T), logical_shape
+    )
+    src_of = np.full(prod(logical_shape), -1, dtype=np.int64)
+    src_of[in_lin[::-1]] = in_pos[::-1]
+    assert (src_of >= 0).all(), "repack input layout does not hold every element"
+    return src_of, in_valid
+
+
+def _build_plan(in_layout, out_layout, logical_shape, start, end, dst, in_idx):
+    """Plan moving input element ``in_idx[i]`` to global output slot ``dst[i]``."""
+    n = in_layout.n
+    assert out_layout.n == n
+    src_of, in_valid = _source_positions(in_layout, logical_shape)
+    src = src_of[np.ravel_multi_index(tuple(in_idx.T), logical_shape)]
+
+    stages = []
+    occupied = in_valid
+    for from_pos, to_pos in _stage_positions(
+        in_idx, src, dst, logical_shape, start, end, n
+    ):
+        stages.append(_stage_moves(from_pos, to_pos, occupied, n))
+        occupied = _occupied(to_pos, int(to_pos.max()) // n + 1, n)
+    return RepackPlan(tuple(stages), out_layout.num_ct())
+
+
 def flatten_repack_plan(in_layout, out_layout, logical_shape, start, end):
     """Plan to move the logical elements of ``in_layout`` to their flattened slots.
 
@@ -173,6 +215,7 @@ def flatten_repack_plan(in_layout, out_layout, logical_shape, start, end):
     """
     logical_shape = tuple(logical_shape)
     key = (
+        "flatten",
         in_layout.layout_str(),
         out_layout.layout_str(),
         in_layout.n,
@@ -182,20 +225,6 @@ def flatten_repack_plan(in_layout, out_layout, logical_shape, start, end):
     )
     if key in _PLAN_CACHE:
         return _PLAN_CACHE[key]
-
-    n = in_layout.n
-    assert out_layout.n == n
-
-    # first input slot holding each logical element
-    in_slots = _slot_indices(in_layout, len(logical_shape))
-    in_valid = _valid(in_slots, logical_shape)
-    in_pos = np.flatnonzero(in_valid.reshape(-1))
-    in_lin = np.ravel_multi_index(
-        tuple(in_slots.reshape(-1, len(logical_shape))[in_pos].T), logical_shape
-    )
-    src_of = np.full(prod(logical_shape), -1, dtype=np.int64)
-    src_of[in_lin[::-1]] = in_pos[::-1]
-    assert (src_of >= 0).all(), "flatten input layout does not hold every element"
 
     # every output slot holding a logical element is a target
     out_shape = flattened_shape(logical_shape, start, end)
@@ -208,17 +237,51 @@ def flatten_repack_plan(in_layout, out_layout, logical_shape, start, end):
         [out_idx[:, :start], np.stack(merged_idx, axis=1), out_idx[:, start + 1 :]],
         axis=1,
     )
-    src = src_of[np.ravel_multi_index(tuple(in_idx.T), logical_shape)]
 
-    stages = []
-    occupied = in_valid
-    for from_pos, to_pos in _stage_positions(
-        in_idx, src, dst, logical_shape, start, end
-    ):
-        stages.append(_stage_moves(from_pos, to_pos, occupied, n))
-        occupied = _occupied(to_pos, int(to_pos.max()) // n + 1, n)
+    plan = _build_plan(in_layout, out_layout, logical_shape, start, end, dst, in_idx)
+    _PLAN_CACHE[key] = plan
+    return plan
 
-    plan = RepackPlan(tuple(stages), out_layout.num_ct())
+
+def group_pad_plan(in_layout, out_layout, logical_shape, start, end):
+    """Plan to move the logical elements of ``in_layout`` to their ``out_layout`` slots.
+
+    The tensor shape is unchanged; ``out_layout`` holds dims ``start..end`` in
+    one group dim (see ``Dim.group_dim``).
+
+    Args:
+        in_layout: layout of the group pad input
+        out_layout: layout of the group pad output
+        logical_shape: unpadded shape of the tensor; slots holding an index
+            outside it are padding and assumed to be zero
+        start, end: inclusive range of grouped dims
+
+    Returns:
+        RepackPlan
+    """
+    logical_shape = tuple(logical_shape)
+    key = (
+        "group_pad",
+        in_layout.layout_str(),
+        out_layout.layout_str(),
+        in_layout.n,
+        logical_shape,
+        start,
+        end,
+    )
+    if key in _PLAN_CACHE:
+        return _PLAN_CACHE[key]
+
+    # every output slot holding a logical element is a target
+    out_slots = _slot_indices(out_layout, len(logical_shape))
+    out_valid = _valid(out_slots, logical_shape)
+    dst = np.flatnonzero(out_valid.reshape(-1))
+    in_idx = out_slots.reshape(-1, len(logical_shape))[dst]
+    covered = np.zeros(prod(logical_shape), dtype=bool)
+    covered[np.ravel_multi_index(tuple(in_idx.T), logical_shape)] = True
+    assert covered.all(), "group pad output layout does not hold every element"
+
+    plan = _build_plan(in_layout, out_layout, logical_shape, start, end, dst, in_idx)
     _PLAN_CACHE[key] = plan
     return plan
 
@@ -231,3 +294,22 @@ def flatten_repack_plan_for_kernel(kernel):
     return flatten_repack_plan(
         kernel.cs[0].layout, kernel.layout, kernel.cs[1], args.start, args.end
     )
+
+
+def group_pad_plan_for_kernel(kernel):
+    """Plan for a GROUP_PAD kernel (``cs = [input, logical_input_shape]``)."""
+    from frontends.tensor_args import GroupPadArgs
+
+    args = GroupPadArgs.from_term(kernel.layout.term)
+    return group_pad_plan(
+        kernel.cs[0].layout, kernel.layout, kernel.cs[1], args.start, args.end
+    )
+
+
+def repack_plan_for_kernel(kernel):
+    """Plan for a FLATTEN_REPACK or GROUP_PAD kernel."""
+    from ir.kernel import KernelOp
+
+    if kernel.op == KernelOp.GROUP_PAD:
+        return group_pad_plan_for_kernel(kernel)
+    return flatten_repack_plan_for_kernel(kernel)

@@ -544,6 +544,9 @@ class TensorEvaluator:
                     + list(tensor.shape[args.end + 1 :])
                 )
                 return tensor.reshape(new_shape)
+            case "GroupPad":
+                # layout-only op: values and shape are unchanged
+                return env[term.cs[0]]
             case "Permute":
                 tensor = env[term.cs[0]]
                 return np.moveaxis(tensor, term.cs[1].keys(), term.cs[1].values())

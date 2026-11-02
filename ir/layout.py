@@ -61,8 +61,16 @@ class Layout:
                 self.ct_dims.insert(0, dim)
             elif dim.extent > n:
                 assert dim.extent % n == 0
-                slot_split_dim = Dim(dim.dim, n, dim_type=dim.dim_type)
-                ct_split_dim = Dim(dim.dim, dim.extent // n, n, dim_type=dim.dim_type)
+                slot_split_dim = Dim(
+                    dim.dim, n, dim.stride, dim_type=dim.dim_type, group=dim.group
+                )
+                ct_split_dim = Dim(
+                    dim.dim,
+                    dim.extent // n,
+                    dim.stride * n,
+                    dim_type=dim.dim_type,
+                    group=dim.group,
+                )
                 self.slot_dims.insert(0, slot_split_dim)
                 self.ct_dims.insert(0, ct_split_dim)
                 n //= dim.extent

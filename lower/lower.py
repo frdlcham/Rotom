@@ -124,7 +124,7 @@ class Lower:
                     self.env[term] = lower_transpose(self.env, term)
                 case KernelOp.RESHAPE | KernelOp.FLATTEN:
                     self.env[term] = lower_reshape(self.env, term)
-                case KernelOp.FLATTEN_REPACK:
+                case KernelOp.FLATTEN_REPACK | KernelOp.GROUP_PAD:
                     self.env[term] = lower_flatten_repack(self.env, term)
                 case KernelOp.PERMUTE:
                     self.env[term] = lower_permute(self.env, term)

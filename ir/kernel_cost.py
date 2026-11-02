@@ -530,10 +530,10 @@ class KernelCost:
         return ops
 
     def flatten_repack_ops(self, ops):
-        """Ops of the masks, rotations and adds that repack a padded flatten."""
-        from util.flatten_repack import flatten_repack_plan_for_kernel
+        """Ops of the masks, rotations and adds that repack a padded flatten or group pad."""
+        from util.flatten_repack import repack_plan_for_kernel
 
-        for k, v in flatten_repack_plan_for_kernel(self.kernel).ops().items():
+        for k, v in repack_plan_for_kernel(self.kernel).ops().items():
             ops[k] += v
         return ops
 
@@ -731,7 +731,7 @@ class KernelCost:
                 ops = self.shift_ops(ops)
             case KernelOp.COMPACT:
                 ops = self.compact_ops(ops)
-            case KernelOp.FLATTEN_REPACK:
+            case KernelOp.FLATTEN_REPACK | KernelOp.GROUP_PAD:
                 ops = self.flatten_repack_ops(ops)
             case KernelOp.POLY_CALL:
                 ops = self.poly_call_ops(ops)
@@ -855,10 +855,10 @@ class KernelCost:
                         pass
                     case KernelOp.MUL | KernelOp.ROLL | KernelOp.CONVERSION:
                         d += 1
-                    case KernelOp.FLATTEN_REPACK:
-                        from util.flatten_repack import flatten_repack_plan_for_kernel
+                    case KernelOp.FLATTEN_REPACK | KernelOp.GROUP_PAD:
+                        from util.flatten_repack import repack_plan_for_kernel
 
-                        d += flatten_repack_plan_for_kernel(term).depth
+                        d += repack_plan_for_kernel(term).depth
                     case KernelOp.MATMUL | KernelOp.CONV2D:
                         # HACK: depth actually varies if masking is required or not
                         d += 2

@@ -59,6 +59,7 @@ class TensorOp(Enum):
         POLY_CALL: Polynomial approximation
         RESHAPE: Tensor reshaping
         FLATTEN: Merge consecutive dimensions
+        GROUP_PAD: Pad consecutive dimensions together in the layout
         PERMUTE: Dimension permutation
         INDEX: Tensor indexing
     """
@@ -79,6 +80,7 @@ class TensorOp(Enum):
     POLY_CALL = "PolyCall"  # polynomial approximation call
     RESHAPE = "Reshape"  # tensor reshape
     FLATTEN = "Flatten"  # merge consecutive dims into one (padded as a whole)
+    GROUP_PAD = "GroupPad"  # lay out consecutive dims together, padded as a whole
     PERMUTE = "Permute"  # permute dims
     INDEX = "Index"
     RESCALE = "Rescale"  # scale division
@@ -483,6 +485,34 @@ class TensorTerm:
         """
         assert 0 <= start < end, f"flatten expects start < end, got {start}, {end}"
         return TensorTerm(TensorOp.FLATTEN, [self, start, end], layout)
+
+    def group_pad(
+        self, start: int, end: int, extent: Optional[int] = None, layout=None
+    ) -> "TensorTerm":
+        """Pad dimensions ``start..end`` (inclusive) together instead of one by one.
+
+        The tensor keeps its shape and values; only its layout changes. The
+        grouped dims are laid out row-major in a single layout dimension that is
+        padded to a power of 2 as a whole, e.g. for [C, 5, 14, 14] grouping dims
+        1..3 gives 5*14*14 = 980 -> 1024 slots per channel instead of
+        8*16*16 = 2048. In layout strings this is the dimension
+        ``[1-3@5x14x14:1024:1]``.
+
+        Args:
+            start (int): First dimension to group
+            end (int): Last dimension to group (inclusive)
+            extent (int, optional): Padded extent of the group, a power of 2 at
+                least the number of grouped elements. Defaults to the smallest one.
+            layout (str, optional): Tensor layout string for the result
+
+        Returns:
+            TensorTerm: A new tensor term representing the grouped padding
+
+        Example:
+            >>> b = a.group_pad(1, 3)  # [C, T, H, W], with T*H*W padded as a whole
+        """
+        assert 0 <= start < end, f"group_pad expects start < end, got {start}, {end}"
+        return TensorTerm(TensorOp.GROUP_PAD, [self, start, end, extent], layout)
 
     def permute(self, dim_map, layout=None):
         """Permute tensor dimensions.

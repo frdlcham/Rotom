@@ -1,11 +1,11 @@
 from ir.he import HETerm
 from lower.layout_cts import LayoutCiphertexts
-from util.flatten_repack import flatten_repack_plan_for_kernel
+from util.flatten_repack import repack_plan_for_kernel
 
 
 def lower_flatten_repack(env, kernel):
-    """Lower a FLATTEN_REPACK kernel by masking, rotating and summing slots."""
-    plan = flatten_repack_plan_for_kernel(kernel)
+    """Lower a FLATTEN_REPACK or GROUP_PAD kernel by masking, rotating and summing slots."""
+    plan = repack_plan_for_kernel(kernel)
     cts = dict(env[kernel.cs[0]].cts)
     for stage in plan.stages:
         new_cts = {}

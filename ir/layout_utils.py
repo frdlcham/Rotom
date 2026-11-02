@@ -27,6 +27,7 @@ def merge_dims(dims, in_roll):
             continue
         if (
             base_dim.dim == next_dim.dim
+            and base_dim.group == next_dim.group
             and base_dim.dim_type == next_dim.dim_type
             and base_dim.stride == next_dim.extent * next_dim.stride
         ):

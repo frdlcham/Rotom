@@ -33,6 +33,7 @@ from assignment.gen.gen_mean import gen_mean
 from assignment.gen.gen_conv2d import gen_conv2d, gen_conv2d_roll
 from assignment.gen.gen_conv3d import gen_conv3d, gen_depthwise_conv3d
 from assignment.gen.gen_flatten import gen_flatten
+from assignment.gen.gen_group_pad import gen_group_pad
 from assignment.gen.gen_index import gen_index
 from assignment.gen.gen_permute import gen_permute
 from assignment.gen.gen_poly_call import gen_poly_call
@@ -214,6 +215,10 @@ class LayoutAssignment:
                     cs_kernels[0],
                     self.shape.shapes[args.input],
                     self.shape.padded_shapes[args.input],
+                )
+            case TensorOp.GROUP_PAD:
+                kernels = gen_group_pad(
+                    term, cs_kernels[0], self.shape.shapes[term.cs[0]]
                 )
             case TensorOp.PERMUTE:
                 kernels = gen_permute(term, cs_kernels[0])
@@ -481,6 +486,7 @@ class LayoutAssignment:
                 | TensorOp.PRODUCT
                 | TensorOp.RESHAPE
                 | TensorOp.FLATTEN
+                | TensorOp.GROUP_PAD
                 | TensorOp.PERMUTE
                 | TensorOp.INDEX
                 | TensorOp.TILE
@@ -633,6 +639,9 @@ class LayoutAssignment:
                 # Skip EMPTY dimensions - they should have dim=None and shouldn't contribute to shape
                 if dim.dim_type == DimType.EMPTY:
                     continue
+                elif dim.is_group:
+                    for d, extent in zip(dim.dim, dim.group):
+                        kernel_shape_map[d] = extent
                 elif dim.dim is not None and dim.dim not in kernel_shape_map:
                     kernel_shape_map[dim.dim] = dim.extent
                 elif dim.dim is not None:
