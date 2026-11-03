@@ -182,6 +182,7 @@ class LayoutAssignment:
                         cs_kernels,
                         cs_shapes,
                         self.roll_flag,
+                        self.get_unpadded_cs_shapes(term),
                     )
                     for t, kernels in kernel_map.items():
                         self.update_kernels(t, kernels)

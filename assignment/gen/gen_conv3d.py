@@ -95,6 +95,10 @@ def _materialized_tensor_shape(output_layout):
     for d in output_layout.get_dims():
         if d.dim_type == DimType.EMPTY or d.dim is None:
             continue
+        if d.is_group:
+            # a group split over ciphertexts and slots repeats the same group
+            shape_map.update(zip(d.dim, d.group))
+            continue
         shape_map[d.dim] = shape_map.get(d.dim, 1) * d.extent
     if not shape_map:
         return []
@@ -113,6 +117,9 @@ def _conv3d_output_dims_zip(a_dims, b_dims, d_o_p2, h_o_p2, w_o_p2, stride):
         elif a_dim.dim is None and b_dim.dim == 0:
             # output channel
             output_dims.append(b_dim)
+        elif a_dim.is_group:
+            # grouped spatial dims: stride-1 "same" output keeps the input group
+            output_dims.append(copy(a_dim))
         elif (
             a_dim.dim in (1, 2, 3)
             and a_dim.dim_type == DimType.FILL
@@ -133,6 +140,22 @@ def _conv3d_output_dims_zip(a_dims, b_dims, d_o_p2, h_o_p2, w_o_p2, stride):
     return output_dims
 
 
+def _supports_grouped_input(layout, grouped, b_shape, args):
+    """Whether CONV3D can consume a GROUP_PAD layout of its input.
+
+    Only stride-1 "same" convs keep the input group as output layout. Filter taps
+    are rotations along the row-major group, so for filters larger than 1x1x1
+    the group must sit in the slots.
+    """
+    if args.stride != 1 or args.padding != "same":
+        return False
+    if any(not set(d.dim) <= {1, 2, 3} for d in grouped):
+        return False
+    if any(k > 1 for k in b_shape[2:5]):
+        return not any(d.is_group for d in layout.ct_dims)
+    return True
+
+
 def gen_conv3d(term, cs_kernels, shapes):
     a_shape = shapes[0]
     b_shape = shapes[1]
@@ -146,6 +169,11 @@ def gen_conv3d(term, cs_kernels, shapes):
     output_kernels = set()
     for a_kernel in cs_kernels:
         if a_kernel.layout.rolls:
+            continue
+        grouped = [d for d in a_kernel.layout.get_dims() if d.is_group]
+        if grouped and not _supports_grouped_input(
+            a_kernel.layout, grouped, b_shape, args
+        ):
             continue
 
         replicated_dims, b_dims = add_replicated_dimensions_3d(a_shape, b_shape)
@@ -202,7 +230,11 @@ def gen_conv3d(term, cs_kernels, shapes):
         output_layout = Layout(
             term, [], output_dims, a_kernel.layout.n, a_kernel.layout.secret
         )
-        expected = [b_shape[0], d_o_p2, h_o_p2, w_o_p2]
+        if grouped:
+            # the group pads the spatial dims as a whole, they keep their extents
+            expected = [b_shape[0], d_o, h_o, w_o]
+        else:
+            expected = [b_shape[0], d_o_p2, h_o_p2, w_o_p2]
         if _materialized_tensor_shape(output_layout) != expected:
             continue
 

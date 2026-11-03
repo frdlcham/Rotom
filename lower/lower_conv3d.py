@@ -100,6 +100,25 @@ def _slot_mask_conv3d_same_stride1(
     return mask
 
 
+def _slot_mask_conv3d_grouped(
+    *, base_indices_ct, rot_amt: int, offsets, bounds
+) -> list[int]:
+    """Per-slot mask for stride-1 ``same`` conv3d on a GROUP_PAD input.
+
+    Rotating along a row-major group wraps between rows and reads the group's
+    padding tail, so instead of bounds-checking the source, keep a slot only
+    when the rotated source holds exactly the input voxel its tap needs:
+    same channel, spatial coordinates shifted by ``offsets`` and in bounds.
+    """
+    rows = np.asarray(base_indices_ct, dtype=np.int64)
+    src = rows[(np.arange(len(rows)) + int(rot_amt)) % len(rows)]
+    want = rows[:, 1:4] + np.asarray(offsets)
+    ok = (rows[:, :4] >= 0).all(axis=1)
+    ok &= ((want >= 0) & (want < np.asarray(bounds))).all(axis=1)
+    ok &= (src[:, 0] == rows[:, 0]) & (src[:, 1:4] == want).all(axis=1)
+    return ok.astype(np.int32).tolist()
+
+
 def lower_conv3d(env, kernel):
     """Lower CONV3D kernel to circuit IR (secret input, public filter)."""
     a_cts = env[kernel.cs[0]]
@@ -129,8 +148,15 @@ def lower_conv3d(env, kernel):
 
     spatial = {}
     offset = 1
+    grouped = False
     for dim in kernel.cs[0].layout.get_dims()[::-1]:
-        if dim.dim in (1, 2, 3) and dim.dim_type != DimType.EMPTY:
+        if dim.is_group:
+            # row-major group: axis k steps by the product of the inner extents
+            grouped = True
+            for k, d in enumerate(dim.dim):
+                inner = int(np.prod(dim.group[k + 1 :]))
+                spatial.setdefault(d, (dim.group[k], offset * inner))
+        elif dim.dim in (1, 2, 3) and dim.dim_type != DimType.EMPTY:
             spatial[dim.dim] = (dim.extent, offset)
         offset *= dim.extent
     assert 1 in spatial and 2 in spatial and 3 in spatial
@@ -221,7 +247,18 @@ def lower_conv3d(env, kernel):
         filter_idx = f_d * flat_hw + f_h * flat_w + f_w
         rot_amt = rot_amts[filter_idx]
         a_idx = min(ct_idx, len(a_cs) - 1)
-        if int(_stride) == 1:
+        if grouped:
+            m = _slot_mask_conv3d_grouped(
+                base_indices_ct=base_by_ct[a_idx],
+                rot_amt=rot_amt,
+                offsets=(
+                    int(f_d) - int(pad_front),
+                    int(f_h) - int(pad_top),
+                    int(f_w) - int(pad_left),
+                ),
+                bounds=(din, hin, win),
+            )
+        elif int(_stride) == 1:
             assert base_by_ct is not None
             m = _slot_mask_conv3d_same_stride1(
                 base_indices_ct=base_by_ct[a_idx],

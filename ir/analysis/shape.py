@@ -135,8 +135,19 @@ class Shape:
                     return a_shape
                 if len(a_shape) > len(b_shape):
                     return a_shape
-                else:
-                    return b_shape
+                if len(a_shape) == len(b_shape):
+                    # A GROUP_PAD operand leaves its grouped dims unpadded; where
+                    # the logical extents agree, keep the smaller (grouped) one.
+                    logical_a = self.get_shape(term.cs[0])
+                    logical_b = self.get_shape(term.cs[1])
+                    if logical_a is not None and logical_b is not None:
+                        return [
+                            min(a, b) if la == lb else b
+                            for a, b, la, lb in zip(
+                                a_shape, b_shape, logical_a, logical_b
+                            )
+                        ]
+                return b_shape
             case TensorOp.RESCALE | TensorOp.CAST:
                 # Rescale / cast preserve the shape of the input tensor
                 return copy(self.padded_shapes[term.cs[0]])
@@ -302,6 +313,15 @@ class Shape:
                         w_o = (w_i + 2 * p_w - k_w) // stride + 1
                 else:
                     raise NotImplementedError(f"unknown padding: {padding}")
+
+                # GROUP_PAD input (spatial dims left unpadded): a stride-1 "same"
+                # conv keeps the input's group layout, so keep the logical extents.
+                if (
+                    padding == "same"
+                    and stride == 1
+                    and a_shape[1:4] == [d_i, h_i, w_i]
+                ):
+                    return [c_o, d_o, h_o, w_o]
 
                 return [
                     c_o,

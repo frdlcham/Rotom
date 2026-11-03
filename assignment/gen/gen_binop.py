@@ -106,9 +106,54 @@ def gen_binop_const(term, cs_kernels):
     return output_kernels
 
 
-def gen_binop(term, cs_kernels, shapes, roll_flag):
+def gen_binop_grouped(term, cs_kernels, logical_shapes):
+    """Elementwise op between a GROUP_PAD secret operand and a public tensor.
+
+    The general alignment helpers assume one tensor dim per layout dim, so a
+    public operand of the same logical shape (e.g. a bias) is laid out in exactly
+    the secret operand's group layout instead, and the output keeps it.
+    """
+    match term.op:
+        case TensorOp.ADD:
+            kernel_op = KernelOp.ADD
+        case TensorOp.SUB:
+            kernel_op = KernelOp.SUB
+        case TensorOp.MUL:
+            kernel_op = KernelOp.MUL
+        case _:
+            return {term: set()}
+
+    output_kernels = set()
+    if list(logical_shapes[0]) != list(logical_shapes[1]):
+        return {term: output_kernels}
+    for secret_idx in (0, 1):
+        public_term = term.cs[1 - secret_idx]
+        if public_term.op != TensorOp.TENSOR or public_term.cs[2]:
+            continue
+        for cs_kernel in cs_kernels[secret_idx]:
+            layout = cs_kernel.layout
+            if layout.rolls or not any(d.is_group for d in layout.get_dims()):
+                continue
+            public_layout = Layout(public_term, [], layout.get_dims(), layout.n, False)
+            cs = [None, None]
+            cs[secret_idx] = Kernel(KernelOp.CS, [secret_idx], layout)
+            cs[1 - secret_idx] = Kernel(KernelOp.TENSOR, [], public_layout)
+            output_layout = Layout(term, [], layout.get_dims(), layout.n, True)
+            output_kernel = Kernel(kernel_op, cs, output_layout)
+            # keep both: compaction only pays off when later ops use the result
+            output_kernels.add(output_kernel)
+            output_kernels.add(find_compaction(output_kernel))
+    return {term: output_kernels}
+
+
+def gen_binop(term, cs_kernels, shapes, roll_flag, logical_shapes=None):
     if term.cs[0].op == TensorOp.CONST or term.cs[1].op == TensorOp.CONST:
         return gen_binop_const(term, cs_kernels)
+
+    if logical_shapes is not None and any(
+        d.is_group for kernels in cs_kernels for k in kernels for d in k.layout.get_dims()
+    ):
+        return gen_binop_grouped(term, cs_kernels, logical_shapes)
 
     # get alignment
     alignment = get_dim_alignment(term, shapes)

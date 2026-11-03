@@ -137,3 +137,109 @@ class TestGroupPadEdwardShape:
         plan = group_pad_plan_for_kernel(kernel)
         assert len(plan.stages) > 1
         assert plan.ops()["rot"] < 5 * 14
+
+
+class TestGroupPadConv3d:
+    """CONV3D (stride 1, "same") consuming a GROUP_PAD input keeps its group."""
+
+    def _run(self, tensor_ir, inputs, args, backend):
+        expected = tensor_ir.eval(inputs)
+        results, kernel = run_compiler_and_backend(tensor_ir, inputs, args, backend)
+        assert_results_equal(apply_layout(expected, kernel.layout), results, backend)
+        assert _group_dims(kernel.layout)
+        return kernel
+
+    def _conv(self, c_in, c_out, k, shape, bias=False):
+        x = TensorTerm.Tensor("x", [c_in] + shape, True).group_pad(1, 3)
+        f = TensorTerm.Tensor("f", [c_out, c_in, k, k, k], False)
+        out = TensorTerm.conv3d(x, f, 1, "same")
+        if bias:
+            out = out + TensorTerm.Tensor("b", [c_out] + shape, False)
+        return out
+
+    def _inputs(self, c_in, c_out, k, shape, bias=False):
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=[c_in] + shape),
+            "f": rng.normal(size=(c_out, c_in, k, k, k)),
+        }
+        if bias:
+            inputs["b"] = rng.normal(size=[c_out] + shape)
+        return inputs
+
+    def test_pointwise_conv(self, backend):
+        args = get_default_args()
+        args.n = 256
+        kernel = self._run(
+            self._conv(2, 4, 1, [3, 6, 6]), self._inputs(2, 4, 1, [3, 6, 6]), args, backend
+        )
+        assert kernel.op == KernelOp.CONV3D
+
+    def test_conv_3x3x3(self, backend):
+        args = get_default_args()
+        args.n = 256
+        self._run(
+            self._conv(2, 4, 3, [3, 6, 6]), self._inputs(2, 4, 3, [3, 6, 6]), args, backend
+        )
+
+    def test_conv_3x3x3_channels_share_ciphertext(self, backend):
+        """Taps rotate across row, channel and group-padding boundaries."""
+        args = get_default_args()
+        args.n = 1024
+        self._run(
+            self._conv(2, 4, 3, [3, 5, 6]), self._inputs(2, 4, 3, [3, 5, 6]), args, backend
+        )
+
+    def test_pointwise_conv_with_bias(self, backend):
+        args = get_default_args()
+        args.n = 256
+        self._run(
+            self._conv(2, 4, 1, [3, 6, 6], bias=True),
+            self._inputs(2, 4, 1, [3, 6, 6], bias=True),
+            args,
+            backend,
+        )
+
+    def test_bias_add_compacts_before_next_conv(self, backend):
+        """conv 4->8 leaves 8 sparse ciphertexts; the bias add compacts them to 1."""
+        args = get_default_args()
+        args.n = 1024
+        shape = [3, 6, 6]
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=[4] + shape),
+            "f": rng.normal(size=(8, 4, 1, 1, 1)),
+            "b": rng.normal(size=[8] + shape),
+            "g": rng.normal(size=(8, 8, 1, 1, 1)),
+        }
+        x = TensorTerm.Tensor("x", [4] + shape, True).group_pad(1, 3)
+        f = TensorTerm.Tensor("f", [8, 4, 1, 1, 1], False)
+        b = TensorTerm.Tensor("b", [8] + shape, False)
+        g = TensorTerm.Tensor("g", [8, 8, 1, 1, 1], False)
+        out = TensorTerm.conv3d(TensorTerm.conv3d(x, f, 1, "same") + b, g, 1, "same")
+        kernel = self._run(out, inputs, args, backend)
+        (compact,) = [k for k in kernel.post_order() if k.op == KernelOp.COMPACT]
+        assert _group_dims(compact.layout)
+        assert compact.layout.num_ct() == 1
+
+    def test_depthwise_then_grouped_project_conv(self, backend):
+        """Edward_example structure: depthwise -> group_pad -> project conv + bias."""
+        args = get_default_args()
+        args.n = 1024
+        c, c_out, t, h, w = 4, 2, 3, 6, 6
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=(c, t, h, w)),
+            "fd": rng.normal(size=(c, 3, 3, 3)),
+            "bd": rng.normal(size=(c, t, h // 2, w // 2)),
+            "fp": rng.normal(size=(c_out, c, 1, 1, 1)),
+            "bp": rng.normal(size=(c_out, t, h // 2, w // 2)),
+        }
+        x = TensorTerm.Tensor("x", [c, t, h, w], True)
+        fd = TensorTerm.Tensor("fd", [c, 3, 3, 3], False)
+        bd = TensorTerm.Tensor("bd", [c, t, h // 2, w // 2], False)
+        fp = TensorTerm.Tensor("fp", [c_out, c, 1, 1, 1], False)
+        bp = TensorTerm.Tensor("bp", [c_out, t, h // 2, w // 2], False)
+        depth = (TensorTerm.depthwise_conv3d(x, fd, (1, 2, 2), "same") + bd).group_pad(1, 3)
+        out = TensorTerm.conv3d(depth, fp, 1, "same") + bp
+        self._run(out, inputs, args, backend)
