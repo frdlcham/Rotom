@@ -70,6 +70,11 @@ def generate_api_docs(source_dir):
         ("assignment.assignment", "Layout Assignment"),
     ]
 
+    # api_reference/*.rst is gitignored, so the directory may not exist yet
+    api_dir = os.path.join(source_dir, "api_reference")
+    os.makedirs(api_dir, exist_ok=True)
+    create_api_index(api_dir, modules)
+
     # Create individual module documentation files with progress bar
     progress_bar = tqdm(modules, desc="Generating API docs", unit="module")
     for module_name, title in progress_bar:
@@ -77,6 +82,30 @@ def generate_api_docs(source_dir):
         create_module_doc(source_dir, module_name, title)
         time.sleep(0.01)  # Small delay to show progress
     progress_bar.close()
+
+
+def create_api_index(api_dir, modules):
+    """Create the API reference index page linking all module pages.
+
+    Args:
+        api_dir: api_reference directory inside the Sphinx source directory
+        modules: List of (module_name, title) tuples
+    """
+    title = "API Reference"
+    entries = "\n".join(
+        f"   {module_name.replace('.', '_')}" for module_name, _ in modules
+    )
+    content = f"""{title}
+{"=" * len(title)}
+
+.. toctree::
+   :maxdepth: 2
+
+{entries}
+"""
+
+    with open(os.path.join(api_dir, "index.rst"), "w") as f:
+        f.write(content)
 
 
 def create_module_doc(source_dir, module_name, title):
