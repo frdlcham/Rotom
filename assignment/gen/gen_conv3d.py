@@ -9,6 +9,7 @@ This mirrors `gen_conv2d` but for 3D convolutions with shapes:
 
 from copy import deepcopy as copy
 
+from assignment.gen.gen_compaction import find_compaction
 from frontends.tensor_args import Conv3dArgs
 from ir.dim import Dim, DimType
 from ir.kernel import Kernel, KernelOp
@@ -240,6 +241,7 @@ def gen_conv3d(term, cs_kernels, shapes):
 
         kernel = Kernel(KernelOp.CONV3D, [a_kernel, b_kernel], output_layout)
         output_kernels.add(kernel)
+        output_kernels.add(find_compaction(kernel)) # add compacted kernel as well
 
     return output_kernels
 

@@ -99,6 +99,10 @@ class LayoutAssignment:
         ``args.layout_simplicity_weight`` (or env ``ROTOM_LAYOUT_SIMPLICITY_WEIGHT`` if
         the weight is left at ``0``) adds a small bias toward layouts with fewer
         ``[G:*]`` slot groups and fewer ciphertext axes (see ``util.layout_simplicity``).
+
+        ``args.output_ct_weight`` (or env ``ROTOM_OUTPUT_CT_WEIGHT`` if the weight is
+        left at ``0``) adds ``weight * num_ct`` to the cost of the final output layout,
+        so compacted outputs can win even though nothing consumes them.
     """
 
     def __init__(self, comp, args=None):
@@ -140,6 +144,14 @@ class LayoutAssignment:
             ev = os.environ.get("ROTOM_CHANNEL_GAP_ALIGN_WEIGHT", "").strip()
             if ev:
                 self.channel_gap_align_weight = float(ev)
+
+        self.output_ct_weight = 0.0
+        if args is not None and hasattr(args, "output_ct_weight"):
+            self.output_ct_weight = float(args.output_ct_weight)
+        if self.output_ct_weight == 0.0:
+            ev = os.environ.get("ROTOM_OUTPUT_CT_WEIGHT", "").strip()
+            if ev:
+                self.output_ct_weight = float(ev)
 
         self.secret = Secret(self.comp)
         self.shape = Shape(self.comp)
@@ -804,6 +816,8 @@ class LayoutAssignment:
 
         def _search_sort_key(kv: tuple) -> tuple:
             layout_key, cost = kv
+            # favour fewer output ciphertexts (e.g. a compacted final layout)
+            cost += self.output_ct_weight * layout_key.num_ct()
             gap_pen = 0.0
             if not os.environ.get("ROTOM_DISABLE_CHANNEL_GAP_TIEBREAK", "").strip():
                 t = getattr(layout_key, "term", None)
