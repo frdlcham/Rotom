@@ -243,3 +243,88 @@ class TestGroupPadConv3d:
         depth = (TensorTerm.depthwise_conv3d(x, fd, (1, 2, 2), "same") + bd).group_pad(1, 3)
         out = TensorTerm.conv3d(depth, fp, 1, "same") + bp
         self._run(out, inputs, args, backend)
+
+
+class TestGroupPadDepthwiseConv3d:
+    """DEPTHWISE_CONV3D consuming a GROUP_PAD input produces a grouped output."""
+
+    def _run(self, tensor_ir, inputs, args, backend):
+        expected = tensor_ir.eval(inputs)
+        results, kernel = run_compiler_and_backend(tensor_ir, inputs, args, backend)
+        assert_results_equal(apply_layout(expected, kernel.layout), results, backend)
+        return kernel
+
+    def _depthwise(self, c, shape, k, stride, padding="same"):
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=[c] + shape),
+            "f": rng.normal(size=(c, k, k, k)),
+        }
+        x = TensorTerm.Tensor("x", [c] + shape, True).group_pad(1, 3)
+        f = TensorTerm.Tensor("f", [c, k, k, k], False)
+        return TensorTerm.depthwise_conv3d(x, f, stride, padding), inputs
+
+    def _check(self, c, shape, k, stride, n, backend, padding="same"):
+        args = get_default_args()
+        args.n = n
+        out, inputs = self._depthwise(c, shape, k, stride, padding)
+        kernel = self._run(out, inputs, args, backend)
+        (dw,) = [k for k in kernel.post_order() if k.op == KernelOp.DEPTHWISE_CONV3D]
+        assert _group_dims(dw.cs[0].layout)
+        assert _group_dims(dw.layout)
+        return dw
+
+    def test_stride1_keeps_input_layout(self, backend):
+        dw = self._check(2, [3, 5, 6], 3, 1, 256, backend)
+        assert dw.layout.layout_str() == dw.cs[0].layout.layout_str()
+
+    def test_stride1_channels_share_ciphertext(self, backend):
+        """Taps rotate across row, channel and group-padding boundaries."""
+        self._check(4, [3, 5, 6], 3, 1, 512, backend)
+
+    def test_stride_1_2_2_repacks_to_smaller_group(self, backend):
+        dw = self._check(2, [3, 6, 6], 3, (1, 2, 2), 256, backend)
+        (group,) = {d.group for d in _group_dims(dw.layout)}
+        assert group == (3, 3, 3)
+
+    def test_stride_2_odd_extents(self, backend):
+        self._check(4, [3, 5, 7], 3, 2, 256, backend)
+
+    def test_stride_1_2_2_group_spans_ciphertexts(self, backend):
+        """3*6*7 = 126 -> 128 per channel, larger than a 64-slot ciphertext."""
+        self._check(2, [3, 6, 7], 3, (1, 2, 2), 64, backend)
+
+    def test_valid_stride1_repacks(self, backend):
+        dw = self._check(2, [4, 5, 6], 3, 1, 256, backend, padding="valid")
+        (group,) = {d.group for d in _group_dims(dw.layout)}
+        assert group == (2, 3, 4)
+
+    def test_expand_depthwise_project(self, backend):
+        """Edward_example structure with the input grouped once at the start."""
+        args = get_default_args()
+        args.n = 1024
+        c_in, c, c_out, t, h, w = 2, 4, 2, 3, 6, 6
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=(c_in, t, h, w)),
+            "fe": rng.normal(size=(c, c_in, 1, 1, 1)),
+            "be": rng.normal(size=(c, t, h, w)),
+            "fd": rng.normal(size=(c, 3, 3, 3)),
+            "bd": rng.normal(size=(c, t, h // 2, w // 2)),
+            "fp": rng.normal(size=(c_out, c, 1, 1, 1)),
+            "bp": rng.normal(size=(c_out, t, h // 2, w // 2)),
+        }
+        x = TensorTerm.Tensor("x", [c_in, t, h, w], True).group_pad(1, 3)
+        fe = TensorTerm.Tensor("fe", [c, c_in, 1, 1, 1], False)
+        be = TensorTerm.Tensor("be", [c, t, h, w], False)
+        fd = TensorTerm.Tensor("fd", [c, 3, 3, 3], False)
+        bd = TensorTerm.Tensor("bd", [c, t, h // 2, w // 2], False)
+        fp = TensorTerm.Tensor("fp", [c_out, c, 1, 1, 1], False)
+        bp = TensorTerm.Tensor("bp", [c_out, t, h // 2, w // 2], False)
+        expand = TensorTerm.conv3d(x, fe, 1, "same") + be
+        depth = TensorTerm.depthwise_conv3d(expand, fd, (1, 2, 2), "same") + bd
+        out = TensorTerm.conv3d(depth, fp, 1, "same") + bp
+        kernel = self._run(out, inputs, args, backend)
+        (dw,) = [k for k in kernel.post_order() if k.op == KernelOp.DEPTHWISE_CONV3D]
+        assert _group_dims(dw.layout)
+        assert _group_dims(kernel.layout)

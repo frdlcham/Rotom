@@ -707,14 +707,18 @@ class KernelCost:
             case KernelOp.CONV2D:
                 ops = self.conv2d_ops(ops)
             case KernelOp.DEPTHWISE_CONV3D:
-                # per output ct and filter tap: one rotation, two pt mults, one add
-                taps = self.kernel.cs[1].layout.num_ct() // max(
-                    1, self.kernel.layout.num_ct()
-                )
-                work = taps * self.kernel.layout.num_ct()
+                # per filter ct (one per tap and computing ct): one rotation,
+                # two pt mults, one add; plus the repack of a strided group
+                from util.flatten_repack import depthwise_repack_plan_for_kernel
+
+                work = self.kernel.cs[1].layout.num_ct()
                 ops["rot"] += work
                 ops["mul"] += 2 * work
                 ops["add"] += work
+                plan = depthwise_repack_plan_for_kernel(self.kernel)
+                if plan is not None:
+                    for k, v in plan.ops().items():
+                        ops[k] += v
             case KernelOp.CONV3D:
                 ops = self.conv2d_ops(ops)
             case KernelOp.ROLL:
@@ -862,8 +866,15 @@ class KernelCost:
                     case KernelOp.MATMUL | KernelOp.CONV2D:
                         # HACK: depth actually varies if masking is required or not
                         d += 2
-                    case KernelOp.CONV3D | KernelOp.DEPTHWISE_CONV3D:
+                    case KernelOp.CONV3D:
                         d += 2
+                    case KernelOp.DEPTHWISE_CONV3D:
+                        from util.flatten_repack import (
+                            depthwise_repack_plan_for_kernel,
+                        )
+
+                        plan = depthwise_repack_plan_for_kernel(term)
+                        d += 2 + (plan.depth if plan is not None else 0)
                     case _:
                         raise NotImplementedError(term.op)
         return d

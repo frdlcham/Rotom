@@ -3,10 +3,12 @@ from lower.layout_cts import LayoutCiphertexts
 from util.flatten_repack import repack_plan_for_kernel
 
 
-def lower_flatten_repack(env, kernel):
-    """Lower a FLATTEN_REPACK or GROUP_PAD kernel by masking, rotating and summing slots."""
-    plan = repack_plan_for_kernel(kernel)
-    cts = dict(env[kernel.cs[0]].cts)
+def apply_repack_plan(cts, plan, n):
+    """Run the stages of a ``RepackPlan`` on ``cts`` ({ct index: HETerm}).
+
+    Returns {output ct index: HETerm} for all ``plan.num_out_ct`` ciphertexts.
+    """
+    cts = dict(cts)
     for stage in plan.stages:
         new_cts = {}
         for move in stage:
@@ -22,6 +24,12 @@ def lower_flatten_repack(env, kernel):
 
     # output ciphertexts that only hold padding
     any_ct = next(iter(cts.values()))
-    zero = any_ct * HETerm.mask([[0] * kernel.layout.n])
-    out = {i: cts.get(i, zero) for i in range(plan.num_out_ct)}
+    zero = any_ct * HETerm.mask([[0] * n])
+    return {i: cts.get(i, zero) for i in range(plan.num_out_ct)}
+
+
+def lower_flatten_repack(env, kernel):
+    """Lower a FLATTEN_REPACK or GROUP_PAD kernel by masking, rotating and summing slots."""
+    plan = repack_plan_for_kernel(kernel)
+    out = apply_repack_plan(env[kernel.cs[0]].cts, plan, kernel.layout.n)
     return LayoutCiphertexts(layout=kernel.layout, cts=out)

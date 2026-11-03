@@ -24,6 +24,13 @@ from ir.layout_utils import dimension_merging, merge_dims
 from util.util import prod, round_to_ceiling_power_of_2
 
 
+def _in_range(dim, start, end):
+    """Whether ``dim`` holds only tensor dims ``start..end`` (a group counts too)."""
+    if dim.is_group:
+        return all(start <= d <= end for d in dim.dim)
+    return isinstance(dim.dim, int) and start <= dim.dim <= end
+
+
 def _replace_grouped(dims, group, start, end):
     """Drop gaps, put ``group`` where the first piece of dims ``start..end`` was."""
     new_dims = []
@@ -31,7 +38,7 @@ def _replace_grouped(dims, group, start, end):
     for dim in dims:
         if dim.dim_type == DimType.EMPTY:
             continue
-        if isinstance(dim.dim, int) and start <= dim.dim <= end:
+        if _in_range(dim, start, end):
             if not placed:
                 new_dims.append(group)
                 placed = True
@@ -44,9 +51,7 @@ def _replace_grouped(dims, group, start, end):
 
 def _in_place_layout(term, layout, group, start, end):
     """Keep the ciphertext dims; compress the slot dims, leaving a leading gap."""
-    if group.extent > layout.n or any(
-        isinstance(d.dim, int) and start <= d.dim <= end for d in layout.ct_dims
-    ):
+    if group.extent > layout.n or any(_in_range(d, start, end) for d in layout.ct_dims):
         return None
     slot_dims = _replace_grouped(layout.slot_dims, group, start, end)
     gap = layout.n // int(prod(d.extent for d in slot_dims))

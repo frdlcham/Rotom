@@ -10,11 +10,14 @@ This mirrors `gen_conv2d` but for 3D convolutions with shapes:
 from copy import deepcopy as copy
 
 from assignment.gen.gen_compaction import find_compaction
+from assignment.gen.gen_group_pad import _compact_layout, _in_place_layout
 from frontends.tensor_args import Conv3dArgs
 from ir.dim import Dim, DimType
 from ir.kernel import Kernel, KernelOp
 from ir.layout import Layout
-from util.util import round_to_ceiling_power_of_2
+from ir.layout_utils import dimension_merging
+from util.flatten_repack import depthwise_needs_repack
+from util.util import prod, round_to_ceiling_power_of_2
 
 
 def apply_replication(term, kernel, dim):
@@ -103,7 +106,13 @@ def _materialized_tensor_shape(output_layout):
         shape_map[d.dim] = shape_map.get(d.dim, 1) * d.extent
     if not shape_map:
         return []
-    return [shape_map.get(i, 1) for i in range(max(shape_map.keys()) + 1)]
+    keys_2 = []
+    for key in shape_map.keys():
+        if type(key) is tuple:
+            keys_2.append(max(key))
+        else:
+            keys_2.append(key)
+    return [shape_map.get(i, 1) for i in range(max(keys_2) + 1)]
 
 
 def _conv3d_output_dims_zip(a_dims, b_dims, d_o_p2, h_o_p2, w_o_p2, stride):
@@ -276,6 +285,31 @@ def _axis_extent(layout, axis):
     return extent
 
 
+def _grouped_depthwise_out_layouts(term, layout, out_dhw):
+    """Output layouts of a depthwise Conv3D on a GROUP_PAD input.
+
+    The input group must hold exactly dims 1..3. When the output keeps the input
+    size (stride 1, "same") it keeps the input layout and every tap is a uniform
+    rotation along the group. Otherwise a group cannot leave gaps for the dropped
+    voxels: the output gets a new group of the logical output size, either in
+    place of the old one or re-split over ciphertexts and slots, and the lowering
+    repacks the outputs into it (see ``depthwise_repack_plan``).
+    """
+    groups = [d for d in layout.get_dims() if d.is_group]
+    if any(d.dim != (1, 2, 3) for d in groups):
+        return []
+    if list(groups[0].group) == list(out_dhw):
+        return [Layout(term, [], copy(layout.get_dims()), layout.n, layout.secret)]
+    group = Dim.group_dim(1, out_dhw, round_to_ceiling_power_of_2(prod(out_dhw)))
+    layouts = {}
+    for make_layout in (_in_place_layout, _compact_layout):
+        new_layout = make_layout(term, layout, group, 1, 3)
+        if new_layout is not None:
+            new_layout = dimension_merging(new_layout)
+            layouts[new_layout.layout_str()] = new_layout
+    return list(layouts.values())
+
+
 def gen_depthwise_conv3d(term, cs_kernels, shapes):
     """Depthwise Conv3D: output keeps the input packing.
 
@@ -284,6 +318,9 @@ def gen_depthwise_conv3d(term, cs_kernels, shapes):
     ``o`` sits where input voxel ``o * stride`` sat, so every filter tap is a
     single uniform rotation per ciphertext (plus boundary masks). Lowering is
     correct for any resulting layout; alignment only affects rotation count.
+
+    A GROUP_PAD input (one group over dims 1..3) is handled by
+    ``_grouped_depthwise_out_layouts``.
     """
     args = Conv3dArgs.from_term(term)
     a_shape, b_shape = shapes[0], shapes[1]
@@ -296,6 +333,18 @@ def gen_depthwise_conv3d(term, cs_kernels, shapes):
     for a_kernel in cs_kernels:
         layout = a_kernel.layout
         if layout.rolls:
+            continue
+        if any(d.is_group for d in layout.get_dims()):
+            # taps are computed in the input layout when the output is repacked
+            repack = depthwise_needs_repack(layout, a_shape, out_dhw)
+            for out_layout in _grouped_depthwise_out_layouts(term, layout, out_dhw):
+                b_layout = depthwise_conv3d_filter_layout(
+                    args.filter, layout if repack else out_layout, b_shape[1:]
+                )
+                b_kernel = Kernel(KernelOp.TENSOR, [], b_layout)
+                output_kernels.add(
+                    Kernel(KernelOp.DEPTHWISE_CONV3D, [a_kernel, b_kernel], out_layout)
+                )
             continue
         # Shrink each spatial axis to its output extent, innermost part first,
         # leaving a gap of the removed factor after the shrunk part. An axis may

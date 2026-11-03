@@ -280,6 +280,15 @@ class Shape:
                 out_dhw, _ = Conv3dArgs.depthwise_geometry(
                     logical_a[1:], logical_b[1:], args.stride, args.padding
                 )
+                # GROUP_PAD input (spatial dims left unpadded): the output gets a
+                # group too, so keep the logical extents. Inputs whose spatial
+                # dims are all powers of 2 look the same unpadded and padded.
+                a_shape = self.padded_shapes[args.input]
+                in_dhw = list(logical_a[1:4])
+                if list(a_shape[1:4]) == in_dhw and in_dhw != [
+                    round_to_ceiling_power_of_2(s) for s in in_dhw
+                ]:
+                    return [round_to_ceiling_power_of_2(logical_a[0])] + list(out_dhw)
                 return [round_to_ceiling_power_of_2(logical_a[0])] + [
                     round_to_ceiling_power_of_2(o) for o in out_dhw
                 ]

@@ -6,7 +6,13 @@ from ir.dim import DimType
 from ir.he import HEOp, HETerm
 from ir.layout import Layout
 from lower.layout_cts import LayoutCiphertexts, create_layout_without_dims
+from lower.lower_flatten import apply_repack_plan
 from lower.lower_util import find_sum_dim, rotate_and_sum
+from util.flatten_repack import (
+    depthwise_anchor_rows,
+    depthwise_needs_repack,
+    depthwise_repack_plan,
+)
 from util.layout_util import (
     _get_apply_layout_plan,
     convert_layout_to_mask,
@@ -420,6 +426,57 @@ def _logical_slot_coords(layout, ndims: int = 4) -> np.ndarray:
     return rows.astype(np.int64)
 
 
+def _depthwise_gather(
+    a_cts, b_cts, lookup, anchor_rows, in_shape, out_shape, k_dhw, strides, front, n
+):
+    """Depthwise taps computed at ``anchor_rows`` (num_ct, n, 4): {ct: HETerm}.
+
+    Slot ``s`` of ciphertext ``o`` gets output voxel ``anchor_rows[o, s]``; every
+    tap reads one input slot, and slots are grouped by (source ct, rotation).
+    ``b_cts[tap_idx * num_ct + o]`` holds each slot's channel weight for a tap.
+    """
+    num_ct = anchor_rows.shape[0]
+    slots = np.arange(n, dtype=np.int64)
+    taps = [
+        (i, j, k)
+        for i in range(k_dhw[0])
+        for j in range(k_dhw[1])
+        for k in range(k_dhw[2])
+    ]
+
+    mask_terms: dict[bytes, HETerm] = {}
+    cts = {}
+    for o in range(num_ct):
+        rows = anchor_rows[o]
+        valid_out = np.all((rows >= 0) & (rows < out_shape), axis=1)
+        acc = None
+        for tap_idx, tap in enumerate(taps):
+            src = rows[:, 1:] * strides + np.array(tap) - front
+            valid = valid_out & np.all((src >= 0) & (src < in_shape[1:]), axis=1)
+            if not valid.any():
+                continue
+            src_coords = np.concatenate([rows[valid, :1], src[valid]], axis=1)
+            src_flat = lookup[np.ravel_multi_index(src_coords.T, in_shape)]
+            assert (src_flat >= 0).all(), "input voxel missing from input layout"
+            src_ct, src_slot = src_flat // n, src_flat % n
+            rot = (src_slot - slots[valid]) % n
+            w = b_cts[tap_idx * num_ct + o]
+            groups: dict[tuple[int, int], np.ndarray] = {}
+            for key in set(zip(src_ct.tolist(), rot.tolist())):
+                groups[key] = np.zeros(n, dtype=np.int32)
+            for c, r, s in zip(src_ct.tolist(), rot.tolist(), slots[valid].tolist()):
+                groups[(c, r)][s] = 1
+            for (c, r), m in sorted(groups.items()):
+                key = m.tobytes()
+                if key not in mask_terms:
+                    mask_terms[key] = HETerm.mask([m.tolist()])
+                moved = a_cts[c] if r == 0 else a_cts[c] << int(r)
+                t = moved * mask_terms[key] * w
+                acc = t if acc is None else acc + t
+        cts[o] = acc if acc is not None else HETerm(HEOp.ZERO_MASK, [], False)
+    return cts
+
+
 def lower_depthwise_conv3d(env, kernel):
     """Lower DEPTHWISE_CONV3D: out = sum_taps rot(in, r) * mask * w_tap.
 
@@ -428,6 +485,11 @@ def lower_depthwise_conv3d(env, kernel):
     one rotation per tap per ciphertext. ``w_tap`` is the packed public filter
     (see ``depthwise_conv3d_filter_layout``); masks zero padding and out-of-range
     slots.
+
+    A strided GROUP_PAD input cannot keep its outputs in place (see
+    ``gen_depthwise_conv3d``): the taps are then computed in the input layout, at
+    each output voxel's anchor slot, and the results repacked into the output
+    group (see ``util.flatten_repack.depthwise_repack_plan``).
     """
     a_cts = env[kernel.cs[0]]
     b_cts = env[kernel.cs[1]]
@@ -442,7 +504,6 @@ def lower_depthwise_conv3d(env, kernel):
     out_dhw, front = Conv3dArgs.depthwise_geometry(
         in_shape[1:], k_dhw, term.cs[2], term.cs[3]
     )
-    out_shape = np.array([in_shape[0]] + out_dhw, dtype=np.int64)
     front = np.array(front, dtype=np.int64)
 
     # Logical input coordinate -> flat (ct * n + slot).
@@ -452,44 +513,17 @@ def lower_depthwise_conv3d(env, kernel):
     ok = np.all((flat_rows >= 0) & (flat_rows < in_shape), axis=1)
     lookup[np.ravel_multi_index(flat_rows[ok].T, in_shape)] = np.nonzero(ok)[0]
 
-    out_rows = _logical_slot_coords(out_layout)
-    num_out_ct = out_rows.shape[0]
-    slots = np.arange(n, dtype=np.int64)
-    taps = [
-        (i, j, k)
-        for i in range(k_dhw[0])
-        for j in range(k_dhw[1])
-        for k in range(k_dhw[2])
-    ]
+    repack = depthwise_needs_repack(in_layout, in_shape, out_dhw)
+    if repack:
+        anchor_rows = depthwise_anchor_rows(in_layout, in_shape, out_dhw, strides)
+    else:
+        anchor_rows = _logical_slot_coords(out_layout)
+    out_shape = np.array([in_shape[0]] + list(out_dhw), dtype=np.int64)
 
-    mask_terms: dict[bytes, HETerm] = {}
-    cts = {}
-    for o in range(num_out_ct):
-        rows = out_rows[o]
-        valid_out = np.all((rows >= 0) & (rows < out_shape), axis=1)
-        acc = None
-        for tap_idx, tap in enumerate(taps):
-            src = rows[:, 1:] * strides + np.array(tap) - front
-            valid = valid_out & np.all((src >= 0) & (src < in_shape[1:]), axis=1)
-            if not valid.any():
-                continue
-            src_coords = np.concatenate([rows[valid, :1], src[valid]], axis=1)
-            src_flat = lookup[np.ravel_multi_index(src_coords.T, in_shape)]
-            assert (src_flat >= 0).all(), "input voxel missing from input layout"
-            src_ct, src_slot = src_flat // n, src_flat % n
-            rot = (src_slot - slots[valid]) % n
-            w = b_cts[tap_idx * num_out_ct + o]
-            groups: dict[tuple[int, int], np.ndarray] = {}
-            for key in set(zip(src_ct.tolist(), rot.tolist())):
-                groups[key] = np.zeros(n, dtype=np.int32)
-            for c, r, s in zip(src_ct.tolist(), rot.tolist(), slots[valid].tolist()):
-                groups[(c, r)][s] = 1
-            for (c, r), m in sorted(groups.items()):
-                key = m.tobytes()
-                if key not in mask_terms:
-                    mask_terms[key] = HETerm.mask([m.tolist()])
-                moved = a_cts[c] if r == 0 else a_cts[c] << int(r)
-                t = moved * mask_terms[key] * w
-                acc = t if acc is None else acc + t
-        cts[o] = acc if acc is not None else HETerm(HEOp.ZERO_MASK, [], False)
+    cts = _depthwise_gather(
+        a_cts, b_cts, lookup, anchor_rows, in_shape, out_shape, k_dhw, strides, front, n
+    )
+    if repack:
+        plan = depthwise_repack_plan(in_layout, out_layout, in_shape, out_dhw, strides)
+        cts = apply_repack_plan(cts, plan, n)
     return LayoutCiphertexts(layout=out_layout, cts=cts)

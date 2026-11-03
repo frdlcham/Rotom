@@ -183,21 +183,29 @@ def _source_positions(in_layout, logical_shape):
     return src_of, in_valid
 
 
+def _plan_from_positions(in_idx, src, dst, occupied, logical_shape, start, end, n, num_out_ct):
+    """Plan moving element ``in_idx[i]`` from global slot ``src[i]`` to ``dst[i]``.
+
+    ``occupied`` (num_ct, n) marks the input slots that may be non-zero.
+    """
+    stages = []
+    for from_pos, to_pos in _stage_positions(
+        in_idx, src, dst, logical_shape, start, end, n
+    ):
+        stages.append(_stage_moves(from_pos, to_pos, occupied, n))
+        occupied = _occupied(to_pos, int(to_pos.max()) // n + 1, n)
+    return RepackPlan(tuple(stages), num_out_ct)
+
+
 def _build_plan(in_layout, out_layout, logical_shape, start, end, dst, in_idx):
     """Plan moving input element ``in_idx[i]`` to global output slot ``dst[i]``."""
     n = in_layout.n
     assert out_layout.n == n
     src_of, in_valid = _source_positions(in_layout, logical_shape)
     src = src_of[np.ravel_multi_index(tuple(in_idx.T), logical_shape)]
-
-    stages = []
-    occupied = in_valid
-    for from_pos, to_pos in _stage_positions(
-        in_idx, src, dst, logical_shape, start, end, n
-    ):
-        stages.append(_stage_moves(from_pos, to_pos, occupied, n))
-        occupied = _occupied(to_pos, int(to_pos.max()) // n + 1, n)
-    return RepackPlan(tuple(stages), out_layout.num_ct())
+    return _plan_from_positions(
+        in_idx, src, dst, in_valid, logical_shape, start, end, n, out_layout.num_ct()
+    )
 
 
 def flatten_repack_plan(in_layout, out_layout, logical_shape, start, end):
@@ -284,6 +292,109 @@ def group_pad_plan(in_layout, out_layout, logical_shape, start, end):
     plan = _build_plan(in_layout, out_layout, logical_shape, start, end, dst, in_idx)
     _PLAN_CACHE[key] = plan
     return plan
+
+
+def depthwise_anchor_rows(in_layout, in_shape, out_dhw, strides):
+    """(num_ct, n, 4) output voxel computed at each slot of ``in_layout`` (-1 = none).
+
+    A strided depthwise Conv3D on a GROUP_PAD input first computes output voxel
+    ``(c, o)`` in the slot that holds its anchor, input voxel ``(c, o * stride)``:
+    every filter tap is then one uniform rotation along the input layout. When
+    the input layout replicates a voxel, only its first slot is an anchor.
+    """
+    rows = _slot_indices(in_layout, 4)
+    strides = np.asarray(strides, dtype=np.int64)
+    out_shape = (int(in_shape[0]),) + tuple(int(o) for o in out_dhw)
+    spatial = rows[..., 1:]
+    ok = _valid(rows, in_shape) & (spatial % strides == 0).all(axis=-1)
+    out = np.concatenate([rows[..., :1], spatial // strides], axis=-1)
+    ok &= _valid(out, out_shape)
+
+    flat_ok = ok.reshape(-1)
+    pos = np.flatnonzero(flat_ok)
+    lin = np.ravel_multi_index(tuple(out.reshape(-1, 4)[pos].T), out_shape)
+    _, first = np.unique(lin, return_index=True)
+    keep = np.zeros_like(flat_ok)
+    keep[pos[first]] = True
+
+    anchors = np.full_like(rows, -1)
+    anchors[keep.reshape(ok.shape)] = out[keep.reshape(ok.shape)]
+    return anchors
+
+
+def depthwise_repack_plan(in_layout, out_layout, in_shape, out_dhw, strides):
+    """Plan moving strided depthwise outputs from their anchors to ``out_layout``.
+
+    See ``depthwise_anchor_rows``. Every spatial shift is a sum of per-axis
+    terms, so the staged plan needs ~sum(out extents) rotations.
+    """
+    in_shape = tuple(int(s) for s in in_shape)
+    out_shape = (in_shape[0],) + tuple(int(o) for o in out_dhw)
+    strides = tuple(int(s) for s in strides)
+    key = (
+        "depthwise",
+        in_layout.layout_str(),
+        out_layout.layout_str(),
+        in_layout.n,
+        in_shape,
+        out_shape,
+        strides,
+    )
+    if key in _PLAN_CACHE:
+        return _PLAN_CACHE[key]
+
+    n = in_layout.n
+    assert out_layout.n == n
+    anchors = depthwise_anchor_rows(in_layout, in_shape, out_shape[1:], strides)
+    occupied = anchors[..., 0] >= 0
+    flat = anchors.reshape(-1, 4)
+    pos = np.flatnonzero(occupied.reshape(-1))
+    src_of = np.full(prod(out_shape), -1, dtype=np.int64)
+    src_of[np.ravel_multi_index(tuple(flat[pos].T), out_shape)] = pos
+    assert (src_of >= 0).all(), "input layout misses a depthwise anchor voxel"
+
+    out_slots = _slot_indices(out_layout, 4)
+    dst = np.flatnonzero(_valid(out_slots, out_shape).reshape(-1))
+    out_idx = out_slots.reshape(-1, 4)[dst]
+    src = src_of[np.ravel_multi_index(tuple(out_idx.T), out_shape)]
+
+    plan = _plan_from_positions(
+        out_idx, src, dst, occupied, out_shape, 1, 3, n, out_layout.num_ct()
+    )
+    _PLAN_CACHE[key] = plan
+    return plan
+
+
+def depthwise_needs_repack(in_layout, in_shape, out_dhw):
+    """Whether a depthwise Conv3D on ``in_layout`` repacks its output.
+
+    A GROUP_PAD input cannot leave gaps for the dropped voxels, so an output
+    smaller than the input gets a new, smaller group (see ``gen_depthwise_conv3d``).
+    """
+    grouped = any(d.is_group for d in in_layout.get_dims())
+    return grouped and list(out_dhw) != [int(s) for s in in_shape[1:4]]
+
+
+def depthwise_repack_plan_for_kernel(kernel):
+    """Repack plan of a DEPTHWISE_CONV3D kernel, or None if it needs none."""
+    from frontends.tensor_args import Conv3dArgs
+    from util.shape_util import get_term_shape
+
+    in_layout = kernel.cs[0].layout
+    groups = [d for d in in_layout.get_dims() if d.is_group]
+    if not groups:
+        return None
+    # gen_depthwise_conv3d only accepts groups over exactly dims 1..3, so the
+    # group holds the logical input [D, H, W]; the filter is [C, Kd, Kh, Kw].
+    term = kernel.layout.term
+    f_shape = get_term_shape(term.cs[1])
+    in_shape = [int(f_shape[0])] + [int(e) for e in groups[0].group]
+    out_dhw, _ = Conv3dArgs.depthwise_geometry(
+        in_shape[1:], f_shape[1:], term.cs[2], term.cs[3]
+    )
+    if not depthwise_needs_repack(in_layout, in_shape, out_dhw):
+        return None
+    return depthwise_repack_plan(in_layout, kernel.layout, in_shape, out_dhw, term.cs[2])
 
 
 def flatten_repack_plan_for_kernel(kernel):
