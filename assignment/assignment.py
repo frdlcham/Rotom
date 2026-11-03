@@ -651,7 +651,14 @@ class LayoutAssignment:
             # flatten kernel_shape
             kernel_shape = []
             if kernel_shape_map:
-                for i in range(max(kernel_shape_map.keys()) + 1):
+                keys = kernel_shape_map.keys()
+                keys_2 = []
+                for key in keys:
+                    if type(key) is tuple: # replace grouped dims by their max dim index
+                        keys_2.append(max(key))
+                    else:
+                        keys_2.append(key)
+                for i in range(max(keys_2) + 1):
                     if i not in kernel_shape_map:
                         kernel_shape.append(1)
                     else:
