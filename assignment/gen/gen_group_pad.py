@@ -27,7 +27,13 @@ from ir.dim import Dim, DimType
 from ir.kernel import Kernel, KernelOp
 from ir.layout import Layout
 from ir.layout_utils import dimension_merging, merge_dims
+from util.flatten_repack import group_pad_move_count
 from util.util import prod, round_to_ceiling_power_of_2
+
+# A candidate whose repack needs more than this many times the moves of the
+# cheapest candidate is dropped before its plan (one n-slot mask per move) is
+# built: misaligned input orders need about one move per element.
+MAX_MOVE_RATIO = 4
 
 
 def _in_range(dim, start, end):
@@ -134,4 +140,18 @@ def gen_group_pad(term, cs_kernels, logical_shape):
                 [cs_placeholder, tuple(logical_shape)],
                 new_layout,
             )
-    return list(kernels.values())
+    return _drop_misaligned(list(kernels.values()), logical_shape, start, end)
+
+
+def _drop_misaligned(kernels, logical_shape, start, end):
+    """Keep the kernels within ``MAX_MOVE_RATIO`` of the cheapest repack."""
+    if len(kernels) <= 1:
+        return kernels
+    counts = [
+        group_pad_move_count(
+            k.cs[0].layout, k.layout, tuple(logical_shape), start, end
+        )
+        for k in kernels
+    ]
+    limit = MAX_MOVE_RATIO * max(min(counts), 1)
+    return [k for k, c in zip(kernels, counts) if c <= limit]

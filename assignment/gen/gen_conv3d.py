@@ -16,7 +16,10 @@ from ir.dim import Dim, DimType
 from ir.kernel import Kernel, KernelOp
 from ir.layout import Layout
 from ir.layout_utils import dimension_merging, is_residue_dim, stepped_axes
-from util.flatten_repack import depthwise_needs_repack
+from util.flatten_repack import (
+    depthwise_gather_plan_for_kernel,
+    depthwise_needs_repack,
+)
 from util.util import prod, round_to_ceiling_power_of_2
 
 
@@ -425,9 +428,14 @@ def gen_depthwise_conv3d(term, cs_kernels, shapes):
                     args.filter, layout if repack else out_layout, b_shape[1:]
                 )
                 b_kernel = Kernel(KernelOp.TENSOR, [], b_layout)
-                output_kernels.add(
-                    Kernel(KernelOp.DEPTHWISE_CONV3D, [a_kernel, b_kernel], out_layout)
+                kernel = Kernel(
+                    KernelOp.DEPTHWISE_CONV3D, [a_kernel, b_kernel], out_layout
                 )
+                # drop output layouts misaligned with the input: their taps need
+                # about one rotation per slot (see MAX_GATHER_GROUPS_PER_TAP)
+                if depthwise_gather_plan_for_kernel(kernel) is None:
+                    continue
+                output_kernels.add(kernel)
             continue
         # Shrink each spatial axis to its output extent, innermost part first,
         # leaving a gap of the removed factor after the shrunk part. An axis may

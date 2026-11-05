@@ -139,15 +139,20 @@ def _stage_positions(in_idx, src, dst, logical_shape, start, end, n):
     return list(zip(positions[:-1], positions[1:]))
 
 
-def _stage_moves(from_pos, to_pos, occupied, n):
-    """Group element moves by (src_ct, dst_ct, rotation)."""
+def _stage_groups(from_pos, to_pos, n):
+    """(unique (src_ct, dst_ct, rotation) keys, group of every element, src slots)."""
     src_ct, src_slot = np.divmod(from_pos, n)
     dst_ct, dst_slot = np.divmod(to_pos, n)
     # ct << k moves slot s to slot s - k
     rot = (src_slot - dst_slot) % n
     keys = np.stack([src_ct, dst_ct, rot], axis=1)
     uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
-    inverse = inverse.reshape(-1)
+    return uniq, inverse.reshape(-1), src_slot
+
+
+def _stage_moves(from_pos, to_pos, occupied, n):
+    """Group element moves by (src_ct, dst_ct, rotation)."""
+    uniq, inverse, src_slot = _stage_groups(from_pos, to_pos, n)
 
     moves = []
     for g, (s_ct, d_ct, r) in enumerate(uniq):
@@ -251,6 +256,54 @@ def flatten_repack_plan(in_layout, out_layout, logical_shape, start, end):
     return plan
 
 
+def _group_pad_targets(out_layout, logical_shape):
+    """(global output slots, input index of the element each one holds)."""
+    # every output slot holding a logical element is a target
+    out_slots = _slot_indices(out_layout, len(logical_shape))
+    out_valid = _valid(out_slots, logical_shape)
+    dst = np.flatnonzero(out_valid.reshape(-1))
+    in_idx = out_slots.reshape(-1, len(logical_shape))[dst]
+    covered = np.zeros(prod(logical_shape), dtype=bool)
+    covered[np.ravel_multi_index(tuple(in_idx.T), logical_shape)] = True
+    assert covered.all(), "group pad output layout does not hold every element"
+    return dst, in_idx
+
+
+def group_pad_move_count(in_layout, out_layout, logical_shape, start, end):
+    """Number of moves (masked rotations) of ``group_pad_plan``, without its masks.
+
+    Cheap compared to the plan itself, whose masks take ``n`` slots per move.
+    A misaligned pair of layouts needs about one move per element, an aligned
+    one moves whole runs of elements at once; ``gen_group_pad`` uses this to drop
+    the misaligned candidates before their plans are built.
+    """
+    logical_shape = tuple(logical_shape)
+    key = (
+        "group_pad_count",
+        in_layout.layout_str(),
+        out_layout.layout_str(),
+        in_layout.n,
+        logical_shape,
+        start,
+        end,
+    )
+    if key in _PLAN_CACHE:
+        return _PLAN_CACHE[key]
+
+    n = in_layout.n
+    dst, in_idx = _group_pad_targets(out_layout, logical_shape)
+    src_of, _ = _source_positions(in_layout, logical_shape)
+    src = src_of[np.ravel_multi_index(tuple(in_idx.T), logical_shape)]
+    count = sum(
+        len(_stage_groups(from_pos, to_pos, n)[0])
+        for from_pos, to_pos in _stage_positions(
+            in_idx, src, dst, logical_shape, start, end, n
+        )
+    )
+    _PLAN_CACHE[key] = count
+    return count
+
+
 def group_pad_plan(in_layout, out_layout, logical_shape, start, end):
     """Plan to move the logical elements of ``in_layout`` to their ``out_layout`` slots.
 
@@ -280,15 +333,7 @@ def group_pad_plan(in_layout, out_layout, logical_shape, start, end):
     if key in _PLAN_CACHE:
         return _PLAN_CACHE[key]
 
-    # every output slot holding a logical element is a target
-    out_slots = _slot_indices(out_layout, len(logical_shape))
-    out_valid = _valid(out_slots, logical_shape)
-    dst = np.flatnonzero(out_valid.reshape(-1))
-    in_idx = out_slots.reshape(-1, len(logical_shape))[dst]
-    covered = np.zeros(prod(logical_shape), dtype=bool)
-    covered[np.ravel_multi_index(tuple(in_idx.T), logical_shape)] = True
-    assert covered.all(), "group pad output layout does not hold every element"
-
+    dst, in_idx = _group_pad_targets(out_layout, logical_shape)
     plan = _build_plan(in_layout, out_layout, logical_shape, start, end, dst, in_idx)
     _PLAN_CACHE[key] = plan
     return plan
@@ -434,7 +479,23 @@ class DepthwiseGatherPlan:
         }
 
 
-def depthwise_gather_plan(in_layout, out_layout, in_shape, k_dhw, strides, padding):
+# A (computing ct, tap) pair of an aligned depthwise layout needs only a few
+# (source ct, rotation) groups: one per source ct its channels and residue
+# classes come from. A misaligned pair of layouts (e.g. input slots
+# ``[0:2][group]`` vs output slots ``[group][0:2]``) needs about one per slot,
+# which makes the plan (one n-slot mask per group) explode in time and memory.
+MAX_GATHER_GROUPS_PER_TAP = 16
+
+
+def depthwise_gather_plan(
+    in_layout,
+    out_layout,
+    in_shape,
+    k_dhw,
+    strides,
+    padding,
+    max_groups_per_tap=MAX_GATHER_GROUPS_PER_TAP,
+):
     """Masked rotations computing a depthwise Conv3D directly in its slots.
 
     Slot ``s`` of computing ciphertext ``o`` gets output voxel ``anchor[o, s]``:
@@ -443,6 +504,10 @@ def depthwise_gather_plan(in_layout, out_layout, in_shape, k_dhw, strides, paddi
     ``depthwise_anchor_rows``). Each tap then reads one input slot per valid
     output slot; slots are grouped by (source ciphertext, rotation). An aligned
     layout needs one group per tap and computing ciphertext.
+
+    Returns None as soon as one (computing ct, tap) pair needs more than
+    ``max_groups_per_tap`` groups (``None`` disables the check): the layouts
+    are misaligned, see ``MAX_GATHER_GROUPS_PER_TAP``.
     """
     from frontends.tensor_args import Conv3dArgs
 
@@ -458,6 +523,7 @@ def depthwise_gather_plan(in_layout, out_layout, in_shape, k_dhw, strides, paddi
         k_dhw,
         strides,
         padding,
+        max_groups_per_tap,
     )
     if key in _PLAN_CACHE:
         return _PLAN_CACHE[key]
@@ -502,6 +568,10 @@ def depthwise_gather_plan(in_layout, out_layout, in_shape, k_dhw, strides, paddi
             uniq, inverse = np.unique(
                 np.stack([src_ct, rot], axis=1), axis=0, return_inverse=True
             )
+            if max_groups_per_tap is not None and len(uniq) > max_groups_per_tap:
+                # misaligned: give up before building a mask per slot
+                _PLAN_CACHE[key] = None
+                return None
             inverse = inverse.reshape(-1)
             for g, (c, r) in enumerate(uniq):
                 mask = np.zeros(n, dtype=np.int32)
@@ -514,7 +584,11 @@ def depthwise_gather_plan(in_layout, out_layout, in_shape, k_dhw, strides, paddi
 
 
 def depthwise_gather_plan_for_kernel(kernel):
-    """Gather plan of a DEPTHWISE_CONV3D kernel (its taps, before any repack)."""
+    """Gather plan of a DEPTHWISE_CONV3D kernel (its taps, before any repack).
+
+    None when its input and output layouts are misaligned (see
+    ``depthwise_gather_plan``); ``gen_depthwise_conv3d`` drops such kernels.
+    """
     from util.shape_util import get_term_shape
 
     term = kernel.layout.term

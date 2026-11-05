@@ -261,7 +261,10 @@ class KernelCost(MatmulCostMixin, ConvCostMixin, RollCostMixin):
                     depthwise_repack_plan_for_kernel,
                 )
 
-                for k, v in depthwise_gather_plan_for_kernel(self.kernel).ops().items():
+                gather = depthwise_gather_plan_for_kernel(self.kernel)
+                # gen_depthwise_conv3d drops kernels with misaligned layouts
+                assert gather is not None, "misaligned depthwise layouts"
+                for k, v in gather.ops().items():
                     ops[k] += v
                 plan = depthwise_repack_plan_for_kernel(self.kernel)
                 if plan is not None:

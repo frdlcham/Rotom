@@ -611,6 +611,10 @@ def lower_depthwise_conv3d(env, kernel):
     plan = depthwise_gather_plan(
         in_layout, out_layout, in_shape, k_dhw, term.cs[2], term.cs[3]
     )
+    assert plan is not None, (
+        "depthwise input and output layouts are misaligned "
+        f"({in_layout.layout_str()} -> {out_layout.layout_str()})"
+    )
 
     mask_terms: dict[bytes, HETerm] = {}
     parts: dict[int, list] = {o: [] for o in range(plan.num_out_ct)}
