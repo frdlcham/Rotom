@@ -60,7 +60,8 @@ concrete_bias_depth_conv   = np.broadcast_to(np.random.randn(C_out_2)[:, None, N
 concrete_bias_project_conv = np.broadcast_to(np.random.randn(C_out_3)[:, None, None, None], (C_out_3, T, H//2, W//2)).copy()
 
 # --- CREATE TENSOR OPERATIONS ---
-input = TensorTerm.Tensor("input", [C_in_1, T, H, W], True)  #input ciphertext matrix
+# group_pad here pads 5*28*28 = 3920 to 4096
+input = TensorTerm.Tensor("input", [C_in_1, T, H, W], True).group_pad(1, 3, steps=(1, 2, 2))  #input ciphertext matrix
 filter_expand_conv = TensorTerm.Tensor("filter_expand_conv", filter_shape_1st_conv, False)  # filter plaintext matrix
 bias_expand_conv = TensorTerm.Tensor("bias_expand_conv", [C_out_1, T, H, W], False)  # bias plaintext vector
 
@@ -75,6 +76,12 @@ output_expand_conv = TensorTerm.conv3d(input, filter_expand_conv, stride=STRIDE_
 
 # --- DEPTH CONV ---
 output_depth_conv = TensorTerm.depthwise_conv3d(output_expand_conv, filter_depth_conv, STRIDE_conv_2, "same") + bias_depth_conv
+
+# output_depth_conv = (
+#     TensorTerm.depthwise_conv3d(output_expand_conv, filter_depth_conv, STRIDE_conv_2, "same")
+#     + bias_depth_conv
+# ).group_pad(1, 3)   # 5*14*14 = 980 -> 1024 per channel
+
 
 # --- PROJECT CONV ---
 output_project_conv = TensorTerm.conv3d(output_depth_conv, filter_project_conv, stride=STRIDE_conv_3, padding="same") + bias_project_conv
@@ -91,11 +98,11 @@ kernel = LayoutAssignment(output_project_conv, args).run()
 for k in kernel.post_order():
     print(k)
 
-# --- LOWERING ---
-# circuit_ir = Lower(kernel).run()
-# inputs = {"input": concrete_input, "filter_expand_conv": concrete_filter_expand_conv, 
-#           "filter_depth_conv": concrete_filter_depth_conv, "filter_project_conv": concrete_filter_project_conv, 
-#           "bias_expand_conv": concrete_bias_expand_conv, "bias_depth_conv": concrete_bias_depth_conv, 
-#           "bias_project_conv": concrete_bias_project_conv}
-# results = Toy(circuit_ir, inputs, args).run() # seems to get stuck at 20% forever
-# print("results: ",results)
+# --- LOWERING --- BE WARNED: THIS TAKES AGES 
+circuit_ir = Lower(kernel).run()
+inputs = {"input": concrete_input, "filter_expand_conv": concrete_filter_expand_conv, 
+          "filter_depth_conv": concrete_filter_depth_conv, "filter_project_conv": concrete_filter_project_conv, 
+          "bias_expand_conv": concrete_bias_expand_conv, "bias_depth_conv": concrete_bias_depth_conv, 
+          "bias_project_conv": concrete_bias_project_conv}
+results = Toy(circuit_ir, inputs, args).run() # this is the part that takes ages
+print("results: ",results)
