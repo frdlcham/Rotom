@@ -7,6 +7,7 @@ group dim padded as a whole, e.g. [C, 5, 14, 14] grouped over dims 1..3 takes
 """
 
 import numpy as np
+import pytest
 
 from assignment.assignment import LayoutAssignment
 from frontends.tensor import TensorTerm
@@ -118,6 +119,89 @@ class TestGroupPadToy:
         x = TensorTerm.Tensor("x", [2, 3, 6, 6], True)
         kernel = self._run(x.group_pad(1, 3, extent=128), inputs, args, backend)
         assert {d.extent for d in _group_dims(kernel.layout)} == {128}
+
+
+class TestSteppedGroupDim:
+    """Groups whose axes jump by a per-axis step, e.g. (H, W) parity packing."""
+
+    def test_string_forms(self):
+        layout = Layout.from_string("[2:2:1][3:2:1];[1-3@5x14x14:256:(1, 2, 2)]", 256)
+        assert layout.layout_str() == "[2:2:1][3:2:1];[1-3@5x14x14:256:(1,2,2)]"
+        (group,) = _group_dims(layout)
+        assert group.steps == (1, 2, 2) and group.group_counts == (5, 7, 7)
+        assert group.is_stepped
+        assert group != Dim.group_dim(1, [5, 14, 14], 256)
+        # unit steps print as a plain group
+        assert str(Dim.group_dim(1, [5, 14, 14], 1024, steps=(1, 1, 1))) == (
+            "[1-3@5x14x14:1024:1]"
+        )
+
+    def test_split_over_ciphertexts_keeps_steps(self):
+        layout = Layout.from_string("[1-3@5x14x14:512:(1,2,2)]", 256)
+        assert layout.layout_str() == (
+            "[1-3@5x14x14:2:256:(1,2,2)];[1-3@5x14x14:256:(1,2,2)]"
+        )
+        again = Layout.from_string(layout.layout_str(), 256)
+        assert again.layout_str() == layout.layout_str()
+
+    def test_parity_packing(self):
+        """Each ciphertext holds one (H, W) parity class, row-major."""
+        x = np.arange(64, dtype=np.float64).reshape(1, 1, 8, 8)
+        layout = Layout.from_string("[2:2:1][3:2:1];[1-3@1x8x8:16:(1,2,2)]", 16)
+        cts = np.array(apply_layout(x, layout)).reshape(2, 2, 4, 4)
+        for a in range(2):
+            for b in range(2):
+                np.testing.assert_array_equal(cts[a, b], x[0, 0, a::2, b::2])
+
+    def test_odd_extent_is_padded(self):
+        """7 = 4 + 3: the odd parity class has one padding row/column."""
+        x = np.arange(1, 50, dtype=np.float64).reshape(1, 1, 7, 7)
+        layout = Layout.from_string("[2:2:1][3:2:1];[1-3@1x7x7:16:(1,2,2)]", 16)
+        cts = np.array(apply_layout(x, layout)).reshape(2, 2, 4, 4)
+        for a in range(2):
+            for b in range(2):
+                sub = x[0, 0, a::2, b::2]
+                expected = np.zeros((4, 4))
+                expected[: sub.shape[0], : sub.shape[1]] = sub
+                np.testing.assert_array_equal(cts[a, b], expected)
+
+
+class TestSteppedGroupPadToy:
+    _run = TestGroupPadToy._run
+
+    def _check_stepped(self, shape, n, backend, **kwargs):
+        args = get_default_args()
+        args.n = n
+        rng = np.random.default_rng(0)
+        inputs = {"x": rng.normal(size=shape)}
+        x = TensorTerm.Tensor("x", list(shape), True)
+        kernel = self._run(x.group_pad(1, 3, steps=(1, 2, 2), **kwargs), inputs, args, backend)
+        assert kernel.op == KernelOp.GROUP_PAD
+        (steps,) = {d.steps for d in _group_dims(kernel.layout)}
+        assert steps == (1, 2, 2)
+        # one residue dim per stepped axis holds the parity
+        residues = [
+            d for d in kernel.layout.get_dims() if not d.is_group and d.dim in (2, 3)
+        ]
+        assert sorted((d.dim, d.extent) for d in residues) == [(2, 2), (3, 2)]
+        return kernel
+
+    def test_parity_group_pad(self, backend):
+        kernel = self._check_stepped((2, 3, 6, 6), 256, backend)
+        # 3 * 3 * 3 = 27 positions -> 32
+        assert {d.extent for d in _group_dims(kernel.layout)} == {32}
+
+    def test_parity_group_pad_odd_extents(self, backend):
+        self._check_stepped((2, 3, 7, 7), 256, backend)
+
+    def test_parity_group_pad_explicit_extent(self, backend):
+        kernel = self._check_stepped((2, 3, 6, 6), 256, backend, extent=64)
+        assert {d.extent for d in _group_dims(kernel.layout)} == {64}
+
+    def test_steps_must_match_grouped_dims(self):
+        x = TensorTerm.Tensor("x", [2, 3, 6, 6], True)
+        with pytest.raises(AssertionError):
+            x.group_pad(1, 3, steps=(2, 2))
 
 
 class TestGroupPadEdwardShape:
@@ -328,3 +412,230 @@ class TestGroupPadDepthwiseConv3d:
         (dw,) = [k for k in kernel.post_order() if k.op == KernelOp.DEPTHWISE_CONV3D]
         assert _group_dims(dw.layout)
         assert _group_dims(kernel.layout)
+
+
+# ---------------------------------------------------------------------------
+# Stepped (parity) groups through conv3d, depthwise_conv3d and add
+# ---------------------------------------------------------------------------
+
+
+def _residue_dims(layout):
+    """Non-group dims of tensor dims that a stepped group walks with step > 1."""
+    from ir.layout_utils import is_residue_dim, stepped_axes
+
+    axes = stepped_axes(layout.get_dims())
+    return [d for d in layout.get_dims() if is_residue_dim(d, axes)]
+
+
+def _kernel_ops(tensor_ir, n, op):
+    """(kernel, #rotations, #multiplications) added by the first ``op`` kernel."""
+    from ir.he import HEOp
+    from lower.lower import Lower
+
+    def terms(v):
+        cts = v.cts if hasattr(v, "cts") else v
+        seen = set()
+        for t in cts.values():
+            seen.update(t.post_order())
+        return seen
+
+    args = get_default_args()
+    args.n = n
+    root = LayoutAssignment(tensor_ir, args).run()
+    env = Lower(root).run()
+    (kernel,) = [k for k in root.post_order() if k.op == op]
+    new = terms(env[kernel]) - set().union(*[terms(env[c]) for c in kernel.cs if c in env])
+    return (
+        kernel,
+        sum(t.op == HEOp.ROT for t in new),
+        sum(t.op == HEOp.MUL for t in new),
+    )
+
+
+class TestSteppedConv3d:
+    """CONV3D on a stepped group: stride 1 keeps it, stride s == step drops parity."""
+
+    @pytest.fixture
+    def backend(self):
+        return "toy"
+
+    def _conv(self, c_in, c_out, k, shape, stride, steps):
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=[c_in] + shape),
+            "f": rng.normal(size=(c_out, c_in, k, k, k)),
+        }
+        x = TensorTerm.Tensor("x", [c_in] + shape, True).group_pad(1, 3, steps=steps)
+        f = TensorTerm.Tensor("f", [c_out, c_in, k, k, k], False)
+        return TensorTerm.conv3d(x, f, stride, "same"), inputs
+
+    def _check(self, c_in, c_out, k, shape, stride, steps, n, backend):
+        args = get_default_args()
+        args.n = n
+        out, inputs = self._conv(c_in, c_out, k, shape, stride, steps)
+        kernel = TestGroupPadToy._run(self, out, inputs, args, backend)
+        assert kernel.op == KernelOp.CONV3D
+        assert kernel.cs[0].op == KernelOp.REPLICATE or k == 1
+        return kernel
+
+    def test_pointwise_keeps_parity(self, backend):
+        kernel = self._check(2, 4, 1, [3, 6, 6], 1, (1, 2, 2), 256, backend)
+        (group,) = set(_group_dims(kernel.layout))
+        assert group.steps == (1, 2, 2)
+        assert sorted(d.dim for d in _residue_dims(kernel.layout)) == [2, 3]
+
+    def test_3x3x3_taps_cross_parity_ciphertexts(self, backend):
+        """n=32: both parity dims index ciphertexts, so H/W taps change ciphertext."""
+        kernel = self._check(2, 3, 3, [3, 6, 6], 1, (1, 2, 2), 32, backend)
+        residues = _residue_dims(kernel.layout)
+        assert len(residues) == 2 and all(d in kernel.layout.ct_dims for d in residues)
+
+    def test_3x3x3_parity_in_slots(self, backend):
+        self._check(2, 4, 3, [3, 6, 6], 1, (1, 2, 2), 256, backend)
+
+    def test_stride2_keeps_first_residue_class(self, backend):
+        """Anchors o * 2 are residue class 0: output is a plain 2x3x3 group."""
+        kernel = self._check(2, 3, 3, [4, 6, 6], 2, (2, 2, 2), 32, backend)
+        (group,) = set(_group_dims(kernel.layout))
+        assert group.group == (2, 3, 3) and not group.is_stepped
+        assert not _residue_dims(kernel.layout)
+
+    def test_stride2_odd_extents_group_spans_ciphertexts(self, backend):
+        self._check(2, 3, 3, [3, 5, 7], 2, (2, 2, 2), 16, backend)
+
+    def test_stride2_needs_matching_steps(self):
+        out, _ = self._conv(2, 3, 3, [4, 6, 6], 2, (1, 2, 2))
+        args = get_default_args()
+        args.n = 256
+        with pytest.raises(AssertionError):
+            LayoutAssignment(out, args).run()
+
+
+class TestSteppedDepthwiseConv3d:
+    """DEPTHWISE_CONV3D on a stepped group is computed directly, never repacked."""
+
+    @pytest.fixture
+    def backend(self):
+        return "toy"
+
+    def _depthwise(self, c, shape, k_dhw, stride, steps):
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=[c] + shape),
+            "f": rng.normal(size=[c] + list(k_dhw)),
+        }
+        x = TensorTerm.Tensor("x", [c] + shape, True).group_pad(1, 3, steps=steps)
+        f = TensorTerm.Tensor("f", [c] + list(k_dhw), False)
+        return TensorTerm.depthwise_conv3d(x, f, stride, "same"), inputs
+
+    def _check(self, c, shape, k_dhw, stride, steps, n, backend):
+        from util.flatten_repack import depthwise_repack_plan_for_kernel
+
+        args = get_default_args()
+        args.n = n
+        out, inputs = self._depthwise(c, shape, k_dhw, stride, steps)
+        kernel = TestGroupPadToy._run(self, out, inputs, args, backend)
+        assert kernel.op == KernelOp.DEPTHWISE_CONV3D
+        assert depthwise_repack_plan_for_kernel(kernel) is None
+        return kernel
+
+    def test_parity_stride_1_2_2_drops_parity(self, backend):
+        kernel = self._check(2, [3, 6, 6], (3, 3, 3), (1, 2, 2), (1, 2, 2), 256, backend)
+        (group,) = set(_group_dims(kernel.layout))
+        assert group.group == (3, 3, 3) and not group.is_stepped
+        assert not _residue_dims(kernel.layout)
+
+    def test_parity_in_ciphertexts(self, backend):
+        self._check(2, [3, 6, 6], (3, 3, 3), (1, 2, 2), (1, 2, 2), 32, backend)
+
+    def test_parity_odd_extents(self, backend):
+        kernel = self._check(2, [3, 7, 5], (3, 3, 3), (1, 2, 2), (1, 2, 2), 16, backend)
+        assert {d.group for d in _group_dims(kernel.layout)} == {(3, 4, 3)}
+
+    def test_stride1_keeps_stepped_layout(self, backend):
+        kernel = self._check(2, [3, 6, 6], (3, 3, 3), (1, 1, 1), (1, 2, 2), 32, backend)
+        assert kernel.layout.layout_str() == kernel.cs[0].layout.layout_str()
+
+    def test_unaligned_strides(self, backend):
+        """Stride 2 on T too, but the group only steps H and W."""
+        self._check(2, [4, 6, 6], (3, 3, 3), (2, 2, 2), (1, 2, 2), 32, backend)
+
+    def test_parity_needs_one_rotation_per_tap(self):
+        """Edward's 5x3x3 stride-(1,2,2) depthwise: 45 taps, one rotation each
+        except the unshifted tap, and no repack (a plain group needs one)."""
+        rots = {}
+        for steps in (None, (1, 2, 2)):
+            out, _ = self._depthwise(4, [5, 14, 14], (5, 3, 3), (1, 2, 2), steps)
+            _, rots[steps], muls = _kernel_ops(out, 4096, KernelOp.DEPTHWISE_CONV3D)
+        assert rots[(1, 2, 2)] == 5 * 3 * 3 - 1
+        assert rots[(1, 2, 2)] < rots[None]
+
+
+class TestSteppedAdd:
+
+    @pytest.fixture
+    def backend(self):
+        return "toy"
+    def test_secret_plus_secret(self, backend):
+        args = get_default_args()
+        args.n = 256
+        shape = [2, 3, 6, 6]
+        rng = np.random.default_rng(0)
+        inputs = {"x": rng.normal(size=shape), "y": rng.normal(size=shape)}
+        x = TensorTerm.Tensor("x", shape, True).group_pad(1, 3, steps=(1, 2, 2))
+        y = TensorTerm.Tensor("y", shape, True).group_pad(1, 3, steps=(1, 2, 2))
+        kernel = TestGroupPadToy._run(self, x + y, inputs, args, backend)
+        assert kernel.op == KernelOp.ADD
+        assert {d.steps for d in _group_dims(kernel.layout)} == {(1, 2, 2)}
+
+    def test_bias_on_stepped_conv(self, backend):
+        args = get_default_args()
+        args.n = 256
+        shape = [3, 6, 6]
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=[2] + shape),
+            "f": rng.normal(size=(4, 2, 1, 1, 1)),
+            "b": rng.normal(size=[4] + shape),
+        }
+        x = TensorTerm.Tensor("x", [2] + shape, True).group_pad(1, 3, steps=(1, 2, 2))
+        f = TensorTerm.Tensor("f", [4, 2, 1, 1, 1], False)
+        b = TensorTerm.Tensor("b", [4] + shape, False)
+        out = TensorTerm.conv3d(x, f, 1, "same") + b
+        kernel = TestGroupPadToy._run(self, out, inputs, args, backend)
+        assert {d.steps for d in _group_dims(kernel.layout)} == {(1, 2, 2)}
+
+
+class TestSteppedEdwardChain:
+    """Edward_example with a parity group_pad: expand -> depthwise -> project."""
+
+    @pytest.fixture
+    def backend(self):
+        return "toy"
+
+    @pytest.mark.parametrize("n", [256, 1024])
+    def test_expand_depthwise_project(self, backend, n):
+        args = get_default_args()
+        args.n = n
+        c_in, c, c_out, t, h, w = 2, 4, 3, 3, 6, 6
+        rng = np.random.default_rng(0)
+        shapes = {
+            "x": [c_in, t, h, w],
+            "fe": [c, c_in, 1, 1, 1],
+            "be": [c, t, h, w],
+            "fd": [c, t, 3, 3],
+            "bd": [c, t, h // 2, w // 2],
+            "fp": [c_out, c, 1, 1, 1],
+            "bp": [c_out, t, h // 2, w // 2],
+        }
+        inputs = {k: rng.normal(size=s) for k, s in shapes.items()}
+        T = {k: TensorTerm.Tensor(k, s, k == "x") for k, s in shapes.items()}
+        x = T["x"].group_pad(1, 3, steps=(1, 2, 2))
+        expand = TensorTerm.conv3d(x, T["fe"], 1, "same") + T["be"]
+        depth = TensorTerm.depthwise_conv3d(expand, T["fd"], (1, 2, 2), "same") + T["bd"]
+        out = TensorTerm.conv3d(depth, T["fp"], 1, "same") + T["bp"]
+        kernel = TestGroupPadToy._run(self, out, inputs, args, backend)
+        (dw,) = [k for k in kernel.post_order() if k.op == KernelOp.DEPTHWISE_CONV3D]
+        assert {d.steps for d in _group_dims(dw.cs[0].layout)} == {(1, 2, 2)}
+        assert not any(d.is_stepped for d in _group_dims(dw.layout))
+        assert not _residue_dims(dw.layout)

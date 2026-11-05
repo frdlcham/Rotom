@@ -15,7 +15,7 @@ from frontends.tensor_args import Conv3dArgs
 from ir.dim import Dim, DimType
 from ir.kernel import Kernel, KernelOp
 from ir.layout import Layout
-from ir.layout_utils import dimension_merging
+from ir.layout_utils import dimension_merging, is_residue_dim, stepped_axes
 from util.flatten_repack import depthwise_needs_repack
 from util.util import prod, round_to_ceiling_power_of_2
 
@@ -96,8 +96,12 @@ def add_replicated_dimensions_3d(a_shape, b_shape):
 
 def _materialized_tensor_shape(output_layout):
     shape_map = {}
+    axes = stepped_axes(output_layout.get_dims())
     for d in output_layout.get_dims():
         if d.dim_type == DimType.EMPTY or d.dim is None:
+            continue
+        if is_residue_dim(d, axes):
+            # offsets skipped by a group step: the group already has the extent
             continue
         if d.is_group:
             # a group split over ciphertexts and slots repeats the same group
@@ -115,9 +119,20 @@ def _materialized_tensor_shape(output_layout):
     return [shape_map.get(i, 1) for i in range(max(keys_2) + 1)]
 
 
-def _conv3d_output_dims_zip(a_dims, b_dims, d_o_p2, h_o_p2, w_o_p2, stride):
+def _conv3d_output_dims_zip(
+    a_dims, b_dims, d_o_p2, h_o_p2, w_o_p2, stride, out_dhw=None
+):
+    """Output dims, one per (aligned) input dim.
+
+    A strided conv on a stepped group whose steps equal the stride computes each
+    output voxel ``o`` at its anchor ``o * stride``: the first residue class of
+    the group, which holds the anchors in output order. The output keeps that
+    class as a plain group of the output size; the residue dims become gaps (and
+    are dropped when they index ciphertexts).
+    """
     output_dims = []
     spatial_out_done = {1: False, 2: False, 3: False}
+    axes = stepped_axes(a_dims)
     for a_dim, b_dim in zip(copy(a_dims), copy(b_dims)):
         if a_dim.dim_type == DimType.EMPTY:
             output_dims.append(Dim(None, a_dim.extent, 1, DimType.EMPTY))
@@ -129,7 +144,17 @@ def _conv3d_output_dims_zip(a_dims, b_dims, d_o_p2, h_o_p2, w_o_p2, stride):
             output_dims.append(b_dim)
         elif a_dim.is_group:
             # grouped spatial dims: stride-1 "same" output keeps the input group
-            output_dims.append(copy(a_dim))
+            if stride == 1:
+                output_dims.append(copy(a_dim))
+            else:
+                output_dims.append(
+                    Dim.group_dim(1, out_dhw, a_dim.extent, a_dim.stride)
+                )
+        elif is_residue_dim(a_dim, axes):
+            if stride == 1:
+                output_dims.append(copy(a_dim))
+            else:
+                output_dims.append(Dim(None, a_dim.extent, 1, DimType.EMPTY))
         elif (
             a_dim.dim in (1, 2, 3)
             and a_dim.dim_type == DimType.FILL
@@ -153,16 +178,21 @@ def _conv3d_output_dims_zip(a_dims, b_dims, d_o_p2, h_o_p2, w_o_p2, stride):
 def _supports_grouped_input(layout, grouped, b_shape, args):
     """Whether CONV3D can consume a GROUP_PAD layout of its input.
 
-    Only stride-1 "same" convs keep the input group as output layout. Filter taps
-    are rotations along the row-major group, so for filters larger than 1x1x1
-    the group must sit in the slots.
+    "same" convs only. Stride-1 convs keep the input group (stepped or not) as
+    output layout. A strided conv needs a stepped group over dims 1..3 whose
+    steps all equal the stride (see ``_conv3d_output_dims_zip``). The lowering
+    finds every tap per slot (``lower_conv3d._GroupedConv3dGather``), so the
+    group and its residue dims may sit anywhere; a group split over ciphertexts
+    just needs a second rotation where a tap crosses into the next ciphertext.
     """
-    if args.stride != 1 or args.padding != "same":
+    if args.padding != "same":
         return False
     if any(not set(d.dim) <= {1, 2, 3} for d in grouped):
         return False
-    if any(k > 1 for k in b_shape[2:5]):
-        return not any(d.is_group for d in layout.ct_dims)
+    if args.stride != 1:
+        s = int(args.stride)
+        if any(d.dim != (1, 2, 3) or d.steps != (s, s, s) for d in grouped):
+            return False
     return True
 
 
@@ -185,6 +215,9 @@ def gen_conv3d(term, cs_kernels, shapes):
             a_kernel.layout, grouped, b_shape, args
         ):
             continue
+        # reference the input through a CS placeholder, so that the search adds
+        # the input's subtree cost (see ``LayoutAssignment.update_kernels``)
+        a_kernel = Kernel(KernelOp.CS, [0], a_kernel.layout)
 
         replicated_dims, b_dims = add_replicated_dimensions_3d(a_shape, b_shape)
         for dim in replicated_dims[::-1]:
@@ -227,12 +260,24 @@ def gen_conv3d(term, cs_kernels, shapes):
                 w_o = (w_i + 2 * p_w - k_w) // stride + 1
                 d_o_layout, h_o_layout, w_o_layout = d_o, h_o, w_o
 
+        if grouped and stride != 1 and any(
+            d.group_counts != (d_o, h_o, w_o) for d in grouped
+        ):
+            # the anchors o * stride must be exactly the group's first residue class
+            continue
+
         d_o_p2 = round_to_ceiling_power_of_2(d_o_layout)
         h_o_p2 = round_to_ceiling_power_of_2(h_o_layout)
         w_o_p2 = round_to_ceiling_power_of_2(w_o_layout)
 
         output_dims = _conv3d_output_dims_zip(
-            a_kernel.layout.get_dims(), b_dims, d_o_p2, h_o_p2, w_o_p2, stride
+            a_kernel.layout.get_dims(),
+            b_dims,
+            d_o_p2,
+            h_o_p2,
+            w_o_p2,
+            stride,
+            out_dhw=(d_o, h_o, w_o),
         )
         if output_dims is None:
             continue
@@ -285,15 +330,45 @@ def _axis_extent(layout, axis):
     return extent
 
 
-def _grouped_depthwise_out_layouts(term, layout, out_dhw):
+def _stepped_depthwise_out_layout(term, layout, out_dhw, strides):
+    """Aligned output of a strided depthwise Conv3D on a stepped group.
+
+    When the steps equal the strides, the anchors ``o * stride`` of the output
+    voxels are the group's residue class 0, in output order. The output keeps
+    that class as a plain group of the output size, at the same positions: every
+    tap is then one uniform rotation per (output ciphertext, residue class), as
+    in a parity-packed stride-2 conv. Residue dims become gaps (dropped when
+    they index ciphertexts). Returns None when the steps don't match.
+    """
+    groups = [d for d in layout.get_dims() if d.is_group]
+    if any(tuple(d.steps) != tuple(int(s) for s in strides) for d in groups):
+        return None
+    if any(list(d.group_counts) != list(out_dhw) for d in groups):
+        return None
+    axes = stepped_axes(layout.get_dims())
+    dims = []
+    for d in layout.get_dims():
+        if d.is_group:
+            dims.append(Dim.group_dim(1, out_dhw, d.extent, d.stride))
+        elif is_residue_dim(d, axes):
+            dims.append(Dim(None, d.extent, 1, DimType.EMPTY))
+        else:
+            dims.append(copy(d))
+    return dimension_merging(Layout(term, [], dims, layout.n, layout.secret))
+
+
+def _grouped_depthwise_out_layouts(term, layout, out_dhw, strides):
     """Output layouts of a depthwise Conv3D on a GROUP_PAD input.
 
     The input group must hold exactly dims 1..3. When the output keeps the input
     size (stride 1, "same") it keeps the input layout and every tap is a uniform
-    rotation along the group. Otherwise a group cannot leave gaps for the dropped
-    voxels: the output gets a new group of the logical output size, either in
-    place of the old one or re-split over ciphertexts and slots, and the lowering
-    repacks the outputs into it (see ``depthwise_repack_plan``).
+    rotation along the group (across residue classes for a stepped group).
+    Otherwise a group cannot leave gaps for the dropped voxels: the output gets a
+    new group of the logical output size, either in place of the old one or
+    re-split over ciphertexts and slots. For a plain group the lowering repacks
+    the outputs into it (see ``depthwise_repack_plan``); a stepped group is
+    computed directly in it, and additionally gets the aligned layout of
+    ``_stepped_depthwise_out_layout`` when its steps equal the strides.
     """
     groups = [d for d in layout.get_dims() if d.is_group]
     if any(d.dim != (1, 2, 3) for d in groups):
@@ -302,6 +377,10 @@ def _grouped_depthwise_out_layouts(term, layout, out_dhw):
         return [Layout(term, [], copy(layout.get_dims()), layout.n, layout.secret)]
     group = Dim.group_dim(1, out_dhw, round_to_ceiling_power_of_2(prod(out_dhw)))
     layouts = {}
+    if groups[0].is_stepped:
+        aligned = _stepped_depthwise_out_layout(term, layout, out_dhw, strides)
+        if aligned is not None:
+            layouts[aligned.layout_str()] = aligned
     for make_layout in (_in_place_layout, _compact_layout):
         new_layout = make_layout(term, layout, group, 1, 3)
         if new_layout is not None:
@@ -334,10 +413,14 @@ def gen_depthwise_conv3d(term, cs_kernels, shapes):
         layout = a_kernel.layout
         if layout.rolls:
             continue
+        # CS placeholder: the search then adds the input's subtree cost
+        a_kernel = Kernel(KernelOp.CS, [0], layout)
         if any(d.is_group for d in layout.get_dims()):
             # taps are computed in the input layout when the output is repacked
             repack = depthwise_needs_repack(layout, a_shape, out_dhw)
-            for out_layout in _grouped_depthwise_out_layouts(term, layout, out_dhw):
+            for out_layout in _grouped_depthwise_out_layouts(
+                term, layout, out_dhw, args.stride
+            ):
                 b_layout = depthwise_conv3d_filter_layout(
                     args.filter, layout if repack else out_layout, b_shape[1:]
                 )

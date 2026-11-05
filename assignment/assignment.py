@@ -648,9 +648,16 @@ class LayoutAssignment:
         for kernel in kernels:
             shape = self.shape.padded_shapes[kernel.layout.term]
             kernel_shape_map = {}
+            # a group fixes the extents of its dims; other dims of a stepped
+            # group axis only hold the offsets its step skips
+            grouped = {
+                d for dim in kernel.layout.get_dims() if dim.is_group for d in dim.dim
+            }
             for dim in kernel.layout.get_dims():
                 # Skip EMPTY dimensions - they should have dim=None and shouldn't contribute to shape
                 if dim.dim_type == DimType.EMPTY:
+                    continue
+                elif not dim.is_group and dim.dim in grouped:
                     continue
                 elif dim.is_group:
                     for d, extent in zip(dim.dim, dim.group):

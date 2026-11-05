@@ -7,6 +7,12 @@ GROUP_PAD keeps a tensor's shape and values but changes how dims
 are laid out row-major in a single group dim that is padded as a whole
 (5*14*14 = 980 -> 1024 slots per channel), see ``Dim.group_dim``.
 
+With per-dim ``steps`` the group walks a strided sub-grid and the offsets the
+steps skip get their own (outermost) dims, e.g. steps (1, 2, 2) give
+``[2:2:1][3:2:1];[C][1-3@5x14x14:256:(1,2,2)]``: one ciphertext per (H, W)
+parity class. That is the packing in which a stride-2 conv only needs uniform
+rotations.
+
 The elements are moved into the group dim by the staged repack of
 ``util.flatten_repack``.
 
@@ -49,21 +55,35 @@ def _replace_grouped(dims, group, start, end):
     return new_dims
 
 
+def _residue_dims(group):
+    """One dim per stepped axis of ``group``, holding the offsets its step skips."""
+    if not group.is_group:
+        return []
+    return [Dim(d, s, 1) for d, s in zip(group.dim, group.steps) if s > 1]
+
+
 def _in_place_layout(term, layout, group, start, end):
-    """Keep the ciphertext dims; compress the slot dims, leaving a leading gap."""
+    """Keep the ciphertext dims; compress the slot dims, leaving a leading gap.
+
+    The residue dims of a stepped group become extra (innermost) ciphertext dims.
+    """
     if group.extent > layout.n or any(_in_range(d, start, end) for d in layout.ct_dims):
         return None
     slot_dims = _replace_grouped(layout.slot_dims, group, start, end)
     gap = layout.n // int(prod(d.extent for d in slot_dims))
-    dims = copy(layout.ct_dims)
+    dims = copy(layout.ct_dims) + _residue_dims(group)
     if gap > 1:
         dims.append(Dim(None, gap, 1, DimType.EMPTY))
     return Layout(term, [], dims + slot_dims, layout.n, layout.secret)
 
 
 def _compact_layout(term, layout, group, start, end):
-    """Re-split all dims over ciphertexts and slots, filling the freed slots."""
-    dims = merge_dims(_replace_grouped(layout.get_dims(), group, start, end), set())
+    """Re-split all dims over ciphertexts and slots, filling the freed slots.
+
+    The residue dims of a stepped group go first, i.e. outermost.
+    """
+    dims = _residue_dims(group) + _replace_grouped(layout.get_dims(), group, start, end)
+    dims = merge_dims(dims, set())
     return Layout(term, [], dims, layout.n, layout.secret)
 
 
@@ -85,11 +105,17 @@ def gen_group_pad(term, cs_kernels, logical_shape):
     )
 
     group_shape = [int(s) for s in logical_shape[start : end + 1]]
-    extent = args.extent or round_to_ceiling_power_of_2(prod(group_shape))
-    assert extent >= prod(group_shape) and extent & (extent - 1) == 0, (
-        f"GROUP_PAD extent {extent} must be a power of 2 >= {prod(group_shape)}"
+    steps = args.steps
+    assert len(steps) == len(group_shape), (
+        f"GROUP_PAD needs one step per grouped dim, got {steps} for {group_shape}"
     )
-    group = Dim.group_dim(start, group_shape, extent)
+    # the group walks ceil(extent / step) positions per dim
+    positions = prod(-(-e // s) for e, s in zip(group_shape, steps))
+    extent = args.extent or round_to_ceiling_power_of_2(positions)
+    assert extent >= positions and extent & (extent - 1) == 0, (
+        f"GROUP_PAD extent {extent} must be a power of 2 >= {positions}"
+    )
+    group = Dim.group_dim(start, group_shape, extent, steps=steps)
 
     kernels = {}
     for cs_kernel in cs_kernels:

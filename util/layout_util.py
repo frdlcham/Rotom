@@ -55,6 +55,7 @@ def merge_dims(dims, in_roll):
         if (
             base_dim.dim == next_dim.dim
             and base_dim.group == next_dim.group
+            and base_dim.steps == next_dim.steps
             and base_dim.dim_type == next_dim.dim_type
             and base_dim.stride == next_dim.extent * next_dim.stride
         ):
@@ -787,18 +788,26 @@ def _get_apply_layout_plan(layout, pt_tensor_ndim: int, *, layout_len: int) -> d
                     indices_map[dim.dim] = dim_indices[i]
 
         # group dims: unravel the row-major group position into the grouped
-        # dims; positions past the logical elements are padding
+        # dims, scaled by each axis' step. Other dims of a stepped axis add the
+        # offsets the step skips. Positions past the group and indices past the
+        # logical extents are padding.
         for dim in dims:
             if dim.is_group and dim.dim in indices_map:
                 positions = indices_map.pop(dim.dim)
-                group_size = int(prod(dim.group))
+                counts = dim.group_counts
+                group_size = int(prod(counts))
                 for k, d in enumerate(dim.dim):
-                    assert d not in indices_map, f"dim {d} is grouped and ungrouped"
-                    inner = int(prod(dim.group[k + 1 :]))
-                    indices_map[d] = [
+                    inner = int(prod(counts[k + 1 :]))
+                    idx = [
                         None if p is None or p >= group_size
-                        else (p // inner) % dim.group[k]
+                        else (p // inner) % counts[k] * dim.steps[k]
                         for p in positions
+                    ]
+                    if d in indices_map:
+                        assert dim.steps[k] > 1, f"dim {d} is grouped and ungrouped"
+                        idx = add_vec(idx, indices_map[d])
+                    indices_map[d] = [
+                        None if i is None or i >= dim.group[k] else i for i in idx
                     ]
 
         for i, dim in enumerate(dims):

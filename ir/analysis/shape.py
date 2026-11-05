@@ -331,6 +331,16 @@ class Shape:
                     and a_shape[1:4] == [d_i, h_i, w_i]
                 ):
                     return [c_o, d_o, h_o, w_o]
+                # A strided "same" conv on a stepped group gets a plain group of
+                # the output size. Inputs whose spatial dims are all powers of 2
+                # look the same unpadded and padded, so they keep the padded rule.
+                in_dhw = [d_i, h_i, w_i]
+                if (
+                    padding == "same"
+                    and a_shape[1:4] == in_dhw
+                    and in_dhw != [round_to_ceiling_power_of_2(s) for s in in_dhw]
+                ):
+                    return [c_o, d_o, h_o, w_o]
 
                 return [
                     c_o,

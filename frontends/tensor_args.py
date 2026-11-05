@@ -160,25 +160,29 @@ class FlattenArgs:
 
 @dataclass(frozen=True)
 class GroupPadArgs:
-    """Structured view of a GROUP_PAD term (term.cs = [input, start, end, extent]).
+    """Structured view of a GROUP_PAD term (term.cs = [input, start, end, extent, steps]).
 
     ``end`` is inclusive; ``extent`` is the padded group extent, or None for the
-    smallest power of 2 that holds the grouped elements.
+    smallest power of 2 that holds the grouped positions. ``steps`` holds the
+    per-dim step of the group (all 1 when not given), see ``Dim.group_dim``.
     """
 
     input: Any
     start: int
     end: int
     extent: Optional[int]
+    steps: tuple
 
     @classmethod
     def from_term(cls, term: Any) -> "GroupPadArgs":
-        extent = term.cs[3]
+        start, end, extent = int(term.cs[1]), int(term.cs[2]), term.cs[3]
+        steps = term.cs[4] if len(term.cs) > 4 else None
         return cls(
             input=term.cs[0],
-            start=int(term.cs[1]),
-            end=int(term.cs[2]),
+            start=start,
+            end=end,
             extent=int(extent) if extent is not None else None,
+            steps=tuple(int(s) for s in steps) if steps else (1,) * (end - start + 1),
         )
 
 

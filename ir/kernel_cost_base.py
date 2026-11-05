@@ -254,14 +254,15 @@ class KernelCost(MatmulCostMixin, ConvCostMixin, RollCostMixin):
             case KernelOp.CONV2D_ROLL:
                 ops = self.conv2d_roll_ops(ops)
             case KernelOp.DEPTHWISE_CONV3D:
-                # per filter ct (one per tap and computing ct): one rotation,
-                # two pt mults, one add; plus the repack of a strided group
-                from util.flatten_repack import depthwise_repack_plan_for_kernel
+                # the masked rotations of the taps (one per tap and computing
+                # ct when aligned); plus the repack of a strided plain group
+                from util.flatten_repack import (
+                    depthwise_gather_plan_for_kernel,
+                    depthwise_repack_plan_for_kernel,
+                )
 
-                work = self.kernel.cs[1].layout.num_ct()
-                ops["rot"] += work
-                ops["mul"] += 2 * work
-                ops["add"] += work
+                for k, v in depthwise_gather_plan_for_kernel(self.kernel).ops().items():
+                    ops[k] += v
                 plan = depthwise_repack_plan_for_kernel(self.kernel)
                 if plan is not None:
                     for k, v in plan.ops().items():

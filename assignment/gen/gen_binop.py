@@ -107,11 +107,12 @@ def gen_binop_const(term, cs_kernels):
 
 
 def gen_binop_grouped(term, cs_kernels, logical_shapes):
-    """Elementwise op between a GROUP_PAD secret operand and a public tensor.
+    """Elementwise op on a GROUP_PAD operand (plain or stepped group).
 
     The general alignment helpers assume one tensor dim per layout dim, so a
     public operand of the same logical shape (e.g. a bias) is laid out in exactly
-    the secret operand's group layout instead, and the output keeps it.
+    the secret operand's group layout instead, and the output keeps it. Two
+    secret operands must already share their layout.
     """
     match term.op:
         case TensorOp.ADD:
@@ -141,6 +142,27 @@ def gen_binop_grouped(term, cs_kernels, logical_shapes):
             output_layout = Layout(term, [], layout.get_dims(), layout.n, True)
             output_kernel = Kernel(kernel_op, cs, output_layout)
             # keep both: compaction only pays off when later ops use the result
+            output_kernels.add(output_kernel)
+            output_kernels.add(find_compaction(output_kernel))
+
+    # secret (op) secret: elementwise on identical layouts
+    for a_kernel in cs_kernels[0]:
+        for b_kernel in cs_kernels[1]:
+            a_layout, b_layout = a_kernel.layout, b_kernel.layout
+            if not (a_layout.secret and b_layout.secret):
+                continue
+            if a_layout.rolls or b_layout.rolls:
+                continue
+            if not any(d.is_group for d in a_layout.get_dims()):
+                continue
+            if a_layout.layout_str() != b_layout.layout_str():
+                continue
+            cs = [
+                Kernel(KernelOp.CS, [0], a_layout),
+                Kernel(KernelOp.CS, [1], b_layout),
+            ]
+            output_layout = Layout(term, [], a_layout.get_dims(), a_layout.n, True)
+            output_kernel = Kernel(kernel_op, cs, output_layout)
             output_kernels.add(output_kernel)
             output_kernels.add(find_compaction(output_kernel))
     return {term: output_kernels}

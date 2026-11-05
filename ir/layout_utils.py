@@ -12,6 +12,24 @@ from ir.layout import Layout
 from ir.roll import Roll
 
 
+def stepped_axes(dims):
+    """Tensor dims that a group in ``dims`` walks with a step > 1."""
+    return {
+        d
+        for g in dims
+        if g.is_group
+        for d, step in zip(g.dim, g.steps)
+        if step > 1
+    }
+
+
+def is_residue_dim(dim, axes):
+    """Whether ``dim`` holds offsets a group step skips, e.g. the H parity
+    ``[2:2:1]`` next to ``[1-3@5x14x14:256:(1,2,2)]``; ``axes`` = ``stepped_axes``.
+    """
+    return not dim.is_group and dim.dim_type == DimType.FILL and dim.dim in axes
+
+
 def merge_dims(dims, in_roll):
     """Given a list of dimensions, try and merge the dimensions"""
     merged_dims = []
@@ -28,6 +46,7 @@ def merge_dims(dims, in_roll):
         if (
             base_dim.dim == next_dim.dim
             and base_dim.group == next_dim.group
+            and base_dim.steps == next_dim.steps
             and base_dim.dim_type == next_dim.dim_type
             and base_dim.stride == next_dim.extent * next_dim.stride
         ):

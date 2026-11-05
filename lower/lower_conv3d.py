@@ -5,11 +5,12 @@ from ir.analysis.shape import Shape
 from ir.dim import DimType
 from ir.he import HEOp, HETerm
 from ir.layout import Layout
+from ir.layout_utils import is_residue_dim, stepped_axes
 from lower.layout_cts import LayoutCiphertexts, create_layout_without_dims
 from lower.lower_flatten import apply_repack_plan
 from lower.lower_util import find_sum_dim, rotate_and_sum
 from util.flatten_repack import (
-    depthwise_anchor_rows,
+    depthwise_gather_plan,
     depthwise_needs_repack,
     depthwise_repack_plan,
 )
@@ -106,23 +107,140 @@ def _slot_mask_conv3d_same_stride1(
     return mask
 
 
-def _slot_mask_conv3d_grouped(
-    *, base_indices_ct, rot_amt: int, offsets, bounds
-) -> list[int]:
-    """Per-slot mask for stride-1 ``same`` conv3d on a GROUP_PAD input.
+def _replica_ids(layout) -> np.ndarray:
+    """(num_ct, n) id of the copy each slot belongs to.
 
-    Rotating along a row-major group wraps between rows and reads the group's
-    padding tail, so instead of bounds-checking the source, keep a slot only
-    when the rotated source holds exactly the input voxel its tap needs:
-    same channel, spatial coordinates shifted by ``offsets`` and in bounds.
+    Only replication dims (no tensor dim) count: two slots holding the same
+    input voxel in the same copy have the same id.
     """
-    rows = np.asarray(base_indices_ct, dtype=np.int64)
-    src = rows[(np.arange(len(rows)) + int(rot_amt)) % len(rows)]
-    want = rows[:, 1:4] + np.asarray(offsets)
-    ok = (rows[:, :4] >= 0).all(axis=1)
-    ok &= ((want >= 0) & (want < np.asarray(bounds))).all(axis=1)
-    ok &= (src[:, 0] == rows[:, 0]) & (src[:, 1:4] == want).all(axis=1)
-    return ok.astype(np.int32).tolist()
+
+    def digits(dims, idx):
+        rep = np.zeros_like(idx)
+        mult = inner = 1
+        for d in reversed(dims):
+            digit = (idx // inner) % d.extent
+            inner *= d.extent
+            if d.dim is None and d.dim_type == DimType.FILL:
+                rep = rep + digit * mult
+                mult *= d.extent
+        return rep, mult
+
+    n = int(layout.n)
+    ct_rep, _ = digits(layout.ct_dims, np.arange(layout.num_ct(), dtype=np.int64))
+    slot_total = int(np.prod([d.extent for d in layout.slot_dims], dtype=np.int64))
+    slot_idx = np.arange(n, dtype=np.int64) % max(slot_total, 1)
+    slot_rep, slot_mult = digits(layout.slot_dims, slot_idx)
+    return ct_rep[:, None] * slot_mult + slot_rep[None, :]
+
+
+class _GroupedConv3dGather:
+    """Filter taps of a CONV3D on a GROUP_PAD input, as masked rotations.
+
+    Each slot of input ciphertext ``a_idx`` computes the partial product for its
+    own (anchor) voxel ``v``; tap ``f`` needs voxel ``v + f - pad`` of the same
+    channel and copy. Rotating along a (possibly stepped) group, that voxel may
+    sit in another ciphertext (a different residue class) or at a non-uniform
+    offset, so every slot looks it up and slots are grouped by (source
+    ciphertext, rotation). A plain group in the slots needs one rotation per tap;
+    a stepped group whose residue dims index ciphertexts needs one per
+    (tap, residue class) pair.
+    """
+
+    def __init__(self, layout_a, in_shape, stride):
+        self.n = int(layout_a.n)
+        self.in_shape = np.asarray(in_shape, dtype=np.int64)
+        self.stride = int(stride)
+        rows = _logical_slot_coords(layout_a)
+        self.rows = rows
+        self.rep = _replica_ids(layout_a)
+        self.volume = int(np.prod(self.in_shape))
+
+        flat = rows.reshape(-1, 4)
+        ok = np.all((flat >= 0) & (flat < self.in_shape), axis=1)
+        pos = np.flatnonzero(ok)
+        keys = self.rep.reshape(-1)[pos] * self.volume + np.ravel_multi_index(
+            flat[pos].T, self.in_shape
+        )
+        order = np.argsort(keys, kind="stable")
+        keys, pos = keys[order], pos[order]
+        _, first = np.unique(keys, return_index=True)  # first occurrence wins
+        self.keys, self.pos = keys[first], pos[first]
+
+    def _find(self, query):
+        i = np.searchsorted(self.keys, query)
+        i = np.minimum(i, len(self.keys) - 1)
+        found = self.keys[i] == query
+        assert found.all(), "input voxel missing from conv3d input layout"
+        return self.pos[i]
+
+    def groups(self, a_idx, offsets):
+        """(union mask, [(src_ct, rot, mask)]) for one tap on ciphertext ``a_idx``."""
+        rows = self.rows[a_idx]
+        spatial = rows[:, 1:4]
+        ok = np.all((rows >= 0) & (rows < self.in_shape), axis=1)
+        if self.stride != 1:
+            # only anchors o * stride compute an output voxel
+            ok &= np.all(spatial % self.stride == 0, axis=1)
+        want = spatial + np.asarray(offsets, dtype=np.int64)
+        ok &= np.all((want >= 0) & (want < self.in_shape[1:]), axis=1)
+        slots = np.flatnonzero(ok)
+        if slots.size == 0:
+            return np.zeros(self.n, dtype=np.int32), []
+        coords = np.concatenate([rows[slots, :1], want[slots]], axis=1)
+        query = self.rep[a_idx, slots] * self.volume + np.ravel_multi_index(
+            coords.T, self.in_shape
+        )
+        src = self._find(query)
+        src_ct, src_slot = src // self.n, src % self.n
+        # ``ct << r`` moves slot s + r to slot s
+        rot = (src_slot - slots) % self.n
+        keys = np.stack([src_ct, rot], axis=1)
+        uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+        out = []
+        for g, (c, r) in enumerate(uniq):
+            m = np.zeros(self.n, dtype=np.int32)
+            m[slots[inverse.reshape(-1) == g]] = 1
+            out.append((int(c), int(r), m))
+        return ok.astype(np.int32), out
+
+
+def _keep_first_residue_class(layout_a, b_layout_cts):
+    """Keep only the ciphertexts of residue class 0 of a stepped group.
+
+    A strided conv on a stepped group computes its outputs at the anchors
+    ``o * stride``, which all sit in residue class 0; ciphertexts indexed by a
+    nonzero residue hold no output. Residue dims are matched by position (the
+    filter layout is aligned dim by dim with ``layout_a``), because their
+    filter counterparts ``[R:2:1]`` compare equal by value.
+
+    Returns:
+        (LayoutCiphertexts without the residue ct dims, positions of the dropped
+        dims in ``layout_a.get_dims()``)
+    """
+    axes = stepped_axes(layout_a.get_dims())
+    residue = [
+        i for i, d in enumerate(layout_a.ct_dims) if is_residue_dim(d, axes)
+    ]
+    if not residue:
+        return b_layout_cts, set()
+    b_layout = b_layout_cts.layout
+    assert len(b_layout.ct_dims) == len(layout_a.ct_dims)
+    ct_indices = get_dim_indices(b_layout.ct_dims)
+    keep = [
+        ct
+        for ct in range(b_layout.num_ct())
+        if all(ct_indices[i][ct] == 0 for i in residue)
+    ]
+    new_ct_dims = [d for i, d in enumerate(b_layout.ct_dims) if i not in residue]
+    new_layout = Layout(
+        b_layout.term,
+        [],
+        new_ct_dims + list(b_layout.slot_dims),
+        b_layout.n,
+        b_layout.secret,
+    )
+    cts = {j: b_layout_cts.cts[ct] for j, ct in enumerate(keep)}
+    return LayoutCiphertexts(layout=new_layout, cts=cts), set(residue)
 
 
 def lower_conv3d(env, kernel):
@@ -152,40 +270,45 @@ def lower_conv3d(env, kernel):
     pad_left = kernel.layout.term.cs[4][4]
     _pad_right = kernel.layout.term.cs[4][5]
 
-    spatial = {}
-    offset = 1
-    grouped = False
-    for dim in kernel.cs[0].layout.get_dims()[::-1]:
-        if dim.is_group:
-            # row-major group: axis k steps by the product of the inner extents
-            grouped = True
-            for k, d in enumerate(dim.dim):
-                inner = int(np.prod(dim.group[k + 1 :]))
-                spatial.setdefault(d, (dim.group[k], offset * inner))
-        elif dim.dim in (1, 2, 3) and dim.dim_type != DimType.EMPTY:
-            spatial[dim.dim] = (dim.extent, offset)
-        offset *= dim.extent
-    assert 1 in spatial and 2 in spatial and 3 in spatial
-    d_extent, d_stride = spatial[1]
-    h_extent, h_stride = spatial[2]
-    w_extent, w_stride = spatial[3]
-
-    rot_offset = -pad_front * d_stride - pad_top * h_stride - pad_left * w_stride
-
     k_d, k_h, k_w = b_shape[2], b_shape[3], b_shape[4]
     _stride = kernel.layout.term.cs[2]
     _a_shape = get_term_shape(kernel.cs[0].layout.term)
 
+    layout_a = kernel.cs[0].layout
+    grouped = any(dim.is_group for dim in layout_a.get_dims())
+    gather = None
     rot_amts = []
-    for i in range(k_d):
-        for j in range(k_h):
-            for k in range(k_w):
-                rot_amts.append(i * d_stride + j * h_stride + k * w_stride + rot_offset)
+    if grouped:
+        # GROUP_PAD input: taps are found per slot (see _GroupedConv3dGather)
+        gather = _GroupedConv3dGather(
+            layout_a, [int(e) for e in _a_shape[:4]], int(_stride)
+        )
+    else:
+        spatial = {}
+        offset = 1
+        for dim in layout_a.get_dims()[::-1]:
+            if dim.dim in (1, 2, 3) and dim.dim_type != DimType.EMPTY:
+                spatial[dim.dim] = (dim.extent, offset)
+            offset *= dim.extent
+        assert 1 in spatial and 2 in spatial and 3 in spatial
+        d_extent, d_stride = spatial[1]
+        h_extent, h_stride = spatial[2]
+        w_extent, w_stride = spatial[3]
+
+        rot_offset = -pad_front * d_stride - pad_top * h_stride - pad_left * w_stride
+        for i in range(k_d):
+            for j in range(k_h):
+                for k in range(k_w):
+                    rot_amts.append(
+                        i * d_stride + j * h_stride + k * w_stride + rot_offset
+                    )
 
     filter_masks: list[list[int]] = []
     base_by_ct: list | None = None
     din = hin = win = 0
-    if int(_stride) != 1:
+    if grouped:
+        pass
+    elif int(_stride) != 1:
         for i in range(k_d):
             for j in range(k_h):
                 for k in range(k_w):
@@ -234,6 +357,7 @@ def lower_conv3d(env, kernel):
     flat_w = k_w
     flat_hw = k_h * k_w
     masks = []
+    grouped_taps = []
     for ct_idx in range(b_num_cts):
         f_d = (
             dim_indices_masks[dim_to_pos_masks[2]][ct_idx]
@@ -251,20 +375,19 @@ def lower_conv3d(env, kernel):
             else 0
         )
         filter_idx = f_d * flat_hw + f_h * flat_w + f_w
-        rot_amt = rot_amts[filter_idx]
         a_idx = min(ct_idx, len(a_cs) - 1)
         if grouped:
-            m = _slot_mask_conv3d_grouped(
-                base_indices_ct=base_by_ct[a_idx],
-                rot_amt=rot_amt,
-                offsets=(
-                    int(f_d) - int(pad_front),
-                    int(f_h) - int(pad_top),
-                    int(f_w) - int(pad_left),
-                ),
-                bounds=(din, hin, win),
+            offsets = (
+                int(f_d) - int(pad_front),
+                int(f_h) - int(pad_top),
+                int(f_w) - int(pad_left),
             )
-        elif int(_stride) == 1:
+            m, tap_groups = gather.groups(a_idx, offsets)
+            grouped_taps.append(tap_groups)
+            masks.append(m.tolist())
+            continue
+        rot_amt = rot_amts[filter_idx]
+        if int(_stride) == 1:
             assert base_by_ct is not None
             m = _slot_mask_conv3d_same_stride1(
                 base_indices_ct=base_by_ct[a_idx],
@@ -305,6 +428,20 @@ def lower_conv3d(env, kernel):
 
     cts = {}
     for b_idx, b_ct in enumerate(b_cs):
+        if grouped:
+            parts = []
+            for c, r, m in grouped_taps[b_idx]:
+                key = m.tobytes()
+                if key not in _mask_term_by_key:
+                    _mask_term_by_key[key] = HETerm.mask([m.tolist()])
+                moved = a_cs[c] if r == 0 else a_cs[c] << r
+                parts.append(moved * _mask_term_by_key[key])
+            cts[b_idx] = (
+                _tree_sum(parts) * b_ct
+                if parts
+                else HETerm(HEOp.ZERO_MASK, [], False)
+            )
+            continue
         f_d = dim_indices[dim_to_pos[2]][b_idx] if 2 in dim_to_pos else 0
         f_h = dim_indices[dim_to_pos[3]][b_idx] if 3 in dim_to_pos else 0
         f_w = dim_indices[dim_to_pos[4]][b_idx] if 4 in dim_to_pos else 0
@@ -316,6 +453,11 @@ def lower_conv3d(env, kernel):
         cts[b_idx] = a_masked * b_ct
 
     b_layout_cts = LayoutCiphertexts(layout=kernel.cs[1].layout, cts=cts)
+    dropped = set()
+    if grouped and int(_stride) != 1:
+        b_layout_cts, dropped = _keep_first_residue_class(
+            layout_a, b_layout_cts
+        )
     filter_ct_dims = [
         dim
         for dim in b_layout_cts.layout.ct_dims
@@ -323,10 +465,10 @@ def lower_conv3d(env, kernel):
     ]
 
     filter_a_dims = []
-    for a_dim, b_dim in zip(
-        kernel.cs[0].layout.get_dims(), kernel.cs[1].layout.get_dims()
+    for i, (a_dim, b_dim) in enumerate(
+        zip(kernel.cs[0].layout.get_dims(), kernel.cs[1].layout.get_dims())
     ):
-        if b_dim not in filter_ct_dims:
+        if i not in dropped and b_dim not in filter_ct_dims:
             filter_a_dims.append(a_dim)
 
     for ct_sum_dim in filter_ct_dims:
@@ -426,70 +568,33 @@ def _logical_slot_coords(layout, ndims: int = 4) -> np.ndarray:
     return rows.astype(np.int64)
 
 
-def _depthwise_gather(
-    a_cts, b_cts, lookup, anchor_rows, in_shape, out_shape, k_dhw, strides, front, n
-):
-    """Depthwise taps computed at ``anchor_rows`` (num_ct, n, 4): {ct: HETerm}.
-
-    Slot ``s`` of ciphertext ``o`` gets output voxel ``anchor_rows[o, s]``; every
-    tap reads one input slot, and slots are grouped by (source ct, rotation).
-    ``b_cts[tap_idx * num_ct + o]`` holds each slot's channel weight for a tap.
-    """
-    num_ct = anchor_rows.shape[0]
-    slots = np.arange(n, dtype=np.int64)
-    taps = [
-        (i, j, k)
-        for i in range(k_dhw[0])
-        for j in range(k_dhw[1])
-        for k in range(k_dhw[2])
-    ]
-
-    mask_terms: dict[bytes, HETerm] = {}
-    cts = {}
-    for o in range(num_ct):
-        rows = anchor_rows[o]
-        valid_out = np.all((rows >= 0) & (rows < out_shape), axis=1)
-        acc = None
-        for tap_idx, tap in enumerate(taps):
-            src = rows[:, 1:] * strides + np.array(tap) - front
-            valid = valid_out & np.all((src >= 0) & (src < in_shape[1:]), axis=1)
-            if not valid.any():
-                continue
-            src_coords = np.concatenate([rows[valid, :1], src[valid]], axis=1)
-            src_flat = lookup[np.ravel_multi_index(src_coords.T, in_shape)]
-            assert (src_flat >= 0).all(), "input voxel missing from input layout"
-            src_ct, src_slot = src_flat // n, src_flat % n
-            rot = (src_slot - slots[valid]) % n
-            w = b_cts[tap_idx * num_ct + o]
-            groups: dict[tuple[int, int], np.ndarray] = {}
-            for key in set(zip(src_ct.tolist(), rot.tolist())):
-                groups[key] = np.zeros(n, dtype=np.int32)
-            for c, r, s in zip(src_ct.tolist(), rot.tolist(), slots[valid].tolist()):
-                groups[(c, r)][s] = 1
-            for (c, r), m in sorted(groups.items()):
-                key = m.tobytes()
-                if key not in mask_terms:
-                    mask_terms[key] = HETerm.mask([m.tolist()])
-                moved = a_cts[c] if r == 0 else a_cts[c] << int(r)
-                t = moved * mask_terms[key] * w
-                acc = t if acc is None else acc + t
-        cts[o] = acc if acc is not None else HETerm(HEOp.ZERO_MASK, [], False)
-    return cts
+def _tree_sum(terms):
+    """Sum as a balanced tree: a long gather stays shallow in the circuit."""
+    terms = list(terms)
+    while len(terms) > 1:
+        terms = [
+            terms[i] + terms[i + 1] if i + 1 < len(terms) else terms[i]
+            for i in range(0, len(terms), 2)
+        ]
+    return terms[0]
 
 
 def lower_depthwise_conv3d(env, kernel):
     """Lower DEPTHWISE_CONV3D: out = sum_taps rot(in, r) * mask * w_tap.
 
-    For each output ciphertext and filter tap, every valid output slot reads one
-    input slot; slots are grouped by (source ct, rotation) so a dense layout costs
-    one rotation per tap per ciphertext. ``w_tap`` is the packed public filter
-    (see ``depthwise_conv3d_filter_layout``); masks zero padding and out-of-range
+    The masked rotations come from ``util.flatten_repack.depthwise_gather_plan``
+    (shared with the cost model): for each output ciphertext and filter tap,
+    every valid output slot reads one input slot, and slots are grouped by
+    (source ct, rotation), so a dense or aligned layout costs one rotation per
+    tap per ciphertext. ``w_tap`` is the packed public filter (see
+    ``depthwise_conv3d_filter_layout``); masks zero padding and out-of-range
     slots.
 
-    A strided GROUP_PAD input cannot keep its outputs in place (see
+    A strided plain GROUP_PAD input cannot keep its outputs in place (see
     ``gen_depthwise_conv3d``): the taps are then computed in the input layout, at
     each output voxel's anchor slot, and the results repacked into the output
-    group (see ``util.flatten_repack.depthwise_repack_plan``).
+    group (see ``util.flatten_repack.depthwise_repack_plan``). A stepped group is
+    computed directly in the output layout.
     """
     a_cts = env[kernel.cs[0]]
     b_cts = env[kernel.cs[1]]
@@ -498,32 +603,31 @@ def lower_depthwise_conv3d(env, kernel):
     term = out_layout.term
     n = int(out_layout.n)
 
-    in_shape = np.array(get_term_shape(term.cs[0]), dtype=np.int64)
+    in_shape = [int(s) for s in get_term_shape(term.cs[0])]
     k_dhw = [int(k) for k in get_term_shape(term.cs[1])[1:]]
-    strides = np.array(term.cs[2], dtype=np.int64)
-    out_dhw, front = Conv3dArgs.depthwise_geometry(
+    out_dhw, _ = Conv3dArgs.depthwise_geometry(
         in_shape[1:], k_dhw, term.cs[2], term.cs[3]
     )
-    front = np.array(front, dtype=np.int64)
-
-    # Logical input coordinate -> flat (ct * n + slot).
-    in_rows = _logical_slot_coords(in_layout)
-    lookup = np.full(int(np.prod(in_shape)), -1, dtype=np.int64)
-    flat_rows = in_rows.reshape(-1, 4)
-    ok = np.all((flat_rows >= 0) & (flat_rows < in_shape), axis=1)
-    lookup[np.ravel_multi_index(flat_rows[ok].T, in_shape)] = np.nonzero(ok)[0]
-
-    repack = depthwise_needs_repack(in_layout, in_shape, out_dhw)
-    if repack:
-        anchor_rows = depthwise_anchor_rows(in_layout, in_shape, out_dhw, strides)
-    else:
-        anchor_rows = _logical_slot_coords(out_layout)
-    out_shape = np.array([in_shape[0]] + list(out_dhw), dtype=np.int64)
-
-    cts = _depthwise_gather(
-        a_cts, b_cts, lookup, anchor_rows, in_shape, out_shape, k_dhw, strides, front, n
+    plan = depthwise_gather_plan(
+        in_layout, out_layout, in_shape, k_dhw, term.cs[2], term.cs[3]
     )
-    if repack:
-        plan = depthwise_repack_plan(in_layout, out_layout, in_shape, out_dhw, strides)
-        cts = apply_repack_plan(cts, plan, n)
+
+    mask_terms: dict[bytes, HETerm] = {}
+    parts: dict[int, list] = {o: [] for o in range(plan.num_out_ct)}
+    for m in plan.moves:
+        key = m.mask.tobytes()
+        if key not in mask_terms:
+            mask_terms[key] = HETerm.mask([m.mask.tolist()])
+        moved = a_cts[m.src_ct] if m.rot == 0 else a_cts[m.src_ct] << m.rot
+        w = b_cts[m.tap * plan.num_out_ct + m.dst_ct]
+        parts[m.dst_ct].append(moved * mask_terms[key] * w)
+    cts = {
+        o: _tree_sum(ts) if ts else HETerm(HEOp.ZERO_MASK, [], False)
+        for o, ts in parts.items()
+    }
+    if depthwise_needs_repack(in_layout, in_shape, out_dhw):
+        repack = depthwise_repack_plan(
+            in_layout, out_layout, in_shape, out_dhw, term.cs[2]
+        )
+        cts = apply_repack_plan(cts, repack, n)
     return LayoutCiphertexts(layout=out_layout, cts=cts)

@@ -368,11 +368,15 @@ def depthwise_repack_plan(in_layout, out_layout, in_shape, out_dhw, strides):
 def depthwise_needs_repack(in_layout, in_shape, out_dhw):
     """Whether a depthwise Conv3D on ``in_layout`` repacks its output.
 
-    A GROUP_PAD input cannot leave gaps for the dropped voxels, so an output
-    smaller than the input gets a new, smaller group (see ``gen_depthwise_conv3d``).
+    A plain GROUP_PAD input cannot leave gaps for the dropped voxels, so an
+    output smaller than the input gets a new, smaller group (see
+    ``gen_depthwise_conv3d``). A stepped group never repacks: its output layouts
+    are computed directly (aligned when the steps equal the strides).
     """
-    grouped = any(d.is_group for d in in_layout.get_dims())
-    return grouped and list(out_dhw) != [int(s) for s in in_shape[1:4]]
+    groups = [d for d in in_layout.get_dims() if d.is_group]
+    if not groups or any(d.is_stepped for d in groups):
+        return False
+    return list(out_dhw) != [int(s) for s in in_shape[1:4]]
 
 
 def depthwise_repack_plan_for_kernel(kernel):
@@ -395,6 +399,130 @@ def depthwise_repack_plan_for_kernel(kernel):
     if not depthwise_needs_repack(in_layout, in_shape, out_dhw):
         return None
     return depthwise_repack_plan(in_layout, kernel.layout, in_shape, out_dhw, term.cs[2])
+
+
+@dataclass(frozen=True)
+class GatherMove:
+    """``out[dst_ct] += (cts[src_ct] << rot) * mask * w[tap]``."""
+
+    dst_ct: int
+    tap: int
+    src_ct: int
+    rot: int
+    mask: np.ndarray
+
+
+@dataclass(frozen=True)
+class DepthwiseGatherPlan:
+    """Masked rotations computing a depthwise Conv3D (see ``depthwise_gather_plan``)."""
+
+    moves: tuple
+    num_out_ct: int
+    num_taps: int
+
+    def ops(self):
+        """Ops after common-subexpression elimination: a rotation of the same
+        source ciphertext by the same amount is shared across taps."""
+        rots = {(m.src_ct, m.rot) for m in self.moves if m.rot != 0}
+        per_ct = {}
+        for m in self.moves:
+            per_ct[m.dst_ct] = per_ct.get(m.dst_ct, 0) + 1
+        return {
+            "rot": len(rots),
+            "mul": 2 * len(self.moves),
+            "add": sum(max(k - 1, 0) for k in per_ct.values()),
+        }
+
+
+def depthwise_gather_plan(in_layout, out_layout, in_shape, k_dhw, strides, padding):
+    """Masked rotations computing a depthwise Conv3D directly in its slots.
+
+    Slot ``s`` of computing ciphertext ``o`` gets output voxel ``anchor[o, s]``:
+    its own voxel in ``out_layout``, or, when a plain group is repacked
+    afterwards (``depthwise_needs_repack``), its anchor in ``in_layout`` (see
+    ``depthwise_anchor_rows``). Each tap then reads one input slot per valid
+    output slot; slots are grouped by (source ciphertext, rotation). An aligned
+    layout needs one group per tap and computing ciphertext.
+    """
+    from frontends.tensor_args import Conv3dArgs
+
+    in_shape = tuple(int(s) for s in in_shape)
+    k_dhw = tuple(int(k) for k in k_dhw)
+    strides = tuple(int(s) for s in strides)
+    key = (
+        "depthwise_gather",
+        in_layout.layout_str(),
+        out_layout.layout_str(),
+        in_layout.n,
+        in_shape,
+        k_dhw,
+        strides,
+        padding,
+    )
+    if key in _PLAN_CACHE:
+        return _PLAN_CACHE[key]
+
+    n = int(in_layout.n)
+    out_dhw, front = Conv3dArgs.depthwise_geometry(in_shape[1:], k_dhw, strides, padding)
+    shape = np.asarray(in_shape, dtype=np.int64)
+    out_shape = np.asarray((in_shape[0],) + tuple(out_dhw), dtype=np.int64)
+    stride_arr = np.asarray(strides, dtype=np.int64)
+    front = np.asarray(front, dtype=np.int64)
+
+    # logical input coordinate -> flat (ct * n + slot), first occurrence
+    in_rows = _slot_indices(in_layout, 4).reshape(-1, 4)
+    ok = _valid(in_rows, in_shape)
+    lookup = np.full(prod(in_shape), -1, dtype=np.int64)
+    pos = np.flatnonzero(ok)[::-1]
+    lookup[np.ravel_multi_index(in_rows[pos].T, in_shape)] = pos
+
+    if depthwise_needs_repack(in_layout, in_shape, out_dhw):
+        anchors = depthwise_anchor_rows(in_layout, in_shape, out_dhw, strides)
+    else:
+        anchors = _slot_indices(out_layout, 4)
+
+    taps = [
+        (i, j, k) for i in range(k_dhw[0]) for j in range(k_dhw[1]) for k in range(k_dhw[2])
+    ]
+    moves = []
+    for o in range(anchors.shape[0]):
+        rows = anchors[o]
+        valid_out = _valid(rows, out_shape)
+        for tap_idx, tap in enumerate(taps):
+            src = rows[:, 1:] * stride_arr + np.asarray(tap) - front
+            valid = valid_out & ((src >= 0) & (src < shape[1:])).all(axis=1)
+            slots = np.flatnonzero(valid)
+            if slots.size == 0:
+                continue
+            coords = np.concatenate([rows[slots, :1], src[slots]], axis=1)
+            src_flat = lookup[np.ravel_multi_index(coords.T, in_shape)]
+            assert (src_flat >= 0).all(), "input voxel missing from input layout"
+            src_ct, src_slot = src_flat // n, src_flat % n
+            rot = (src_slot - slots) % n
+            uniq, inverse = np.unique(
+                np.stack([src_ct, rot], axis=1), axis=0, return_inverse=True
+            )
+            inverse = inverse.reshape(-1)
+            for g, (c, r) in enumerate(uniq):
+                mask = np.zeros(n, dtype=np.int32)
+                mask[slots[inverse == g]] = 1
+                moves.append(GatherMove(o, tap_idx, int(c), int(r), mask))
+
+    plan = DepthwiseGatherPlan(tuple(moves), int(anchors.shape[0]), len(taps))
+    _PLAN_CACHE[key] = plan
+    return plan
+
+
+def depthwise_gather_plan_for_kernel(kernel):
+    """Gather plan of a DEPTHWISE_CONV3D kernel (its taps, before any repack)."""
+    from util.shape_util import get_term_shape
+
+    term = kernel.layout.term
+    in_shape = get_term_shape(term.cs[0])
+    k_dhw = get_term_shape(term.cs[1])[1:]
+    return depthwise_gather_plan(
+        kernel.cs[0].layout, kernel.layout, in_shape, k_dhw, term.cs[2], term.cs[3]
+    )
 
 
 def flatten_repack_plan_for_kernel(kernel):

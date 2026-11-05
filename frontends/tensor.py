@@ -29,7 +29,7 @@ Layout Example:
 """
 
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -487,7 +487,12 @@ class TensorTerm:
         return TensorTerm(TensorOp.FLATTEN, [self, start, end], layout)
 
     def group_pad(
-        self, start: int, end: int, extent: Optional[int] = None, layout=None
+        self,
+        start: int,
+        end: int,
+        extent: Optional[int] = None,
+        steps: Optional[Sequence[int]] = None,
+        layout=None,
     ) -> "TensorTerm":
         """Pad dimensions ``start..end`` (inclusive) together instead of one by one.
 
@@ -498,11 +503,19 @@ class TensorTerm:
         8*16*16 = 2048. In layout strings this is the dimension
         ``[1-3@5x14x14:1024:1]``.
 
+        With ``steps``, grouped dim ``start + k`` jumps by ``steps[k]`` inside
+        the group and the skipped offsets get their own dims, e.g. steps
+        (1, 2, 2) gives ``[2:2:1][3:2:1];[1-3@5x14x14:256:(1,2,2)]``: one
+        ciphertext per (H, W) parity, each holding a 5x7x7 grid. That is the
+        packing in which a stride-2 conv needs only uniform rotations.
+
         Args:
             start (int): First dimension to group
             end (int): Last dimension to group (inclusive)
             extent (int, optional): Padded extent of the group, a power of 2 at
-                least the number of grouped elements. Defaults to the smallest one.
+                least the number of grouped positions. Defaults to the smallest one.
+            steps (sequence of int, optional): Per-dim step inside the group,
+                one power of 2 per grouped dim. Defaults to all 1.
             layout (str, optional): Tensor layout string for the result
 
         Returns:
@@ -512,7 +525,14 @@ class TensorTerm:
             >>> b = a.group_pad(1, 3)  # [C, T, H, W], with T*H*W padded as a whole
         """
         assert 0 <= start < end, f"group_pad expects start < end, got {start}, {end}"
-        return TensorTerm(TensorOp.GROUP_PAD, [self, start, end, extent], layout)
+        if steps is not None:
+            steps = tuple(int(s) for s in steps)
+            assert len(steps) == end - start + 1, (
+                f"group_pad expects one step per grouped dim, got {steps}"
+            )
+        return TensorTerm(
+            TensorOp.GROUP_PAD, [self, start, end, extent, steps], layout
+        )
 
     def permute(self, dim_map, layout=None):
         """Permute tensor dimensions.
