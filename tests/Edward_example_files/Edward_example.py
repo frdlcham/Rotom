@@ -10,35 +10,38 @@ from lower.lower import Lower
 #  input:  [C_in, D_in, H_in, W_in]   (secret)
 #  filter: [C_out, C_in, Kd, Kh, Kw] (public)
 
-# SHAPES - doesn't seem to matter if the dimensions are powers of 2 or not?
-# layout always works, actual conv always fails with a mismatch between toy and the expected output
+# SHAPES
 T = 5
 H = 28
 W = 28
 
-# C_in_1 = 32 # channels input to first conv
-# C_out_1 = 184
-
-# C_in_2 = C_out_1
-# C_out_2 = C_in_2 # 2nd conv keeps channels the same
-
-# C_in_3 = C_out_2
-# C_out_3 = 56
-
-# T, H, and W, padded to powers of 2
-# T = 8
-# H = 32
-# W = 32
-
 # Channels padded to powers of 2
 C_in_1 = 32 # channels input to first conv
+C_out_1_unpadded = 184
 C_out_1 = 256
 
 C_in_2 = C_out_1
+C_in_2_unpadded = C_out_1_unpadded
+C_out_2_unpadded = C_in_2_unpadded
 C_out_2 = C_in_2 # 2nd conv keeps channels the same
 
 C_in_3 = C_out_2
+C_in_3_unpadded = C_out_2_unpadded
+C_out_3_unpadded = 56
 C_out_3 = 64
+
+# Rules:
+
+# If you have non-power-of-two T,H,W dimensions (or only H and W, or some other subset of them), 
+# you can first group those and then pad, which can make padding more efficient.
+
+# If you have a conv with stride = (i, j, k), it can be useful to group_pad(1, 3, steps=(i, j, k)), 
+# because this then does the parity layout stuff. 
+# I don't think these steps all need to be powers of two, 
+# since they become the middle number in the outer brackets: [1:i:1][2:j:1][3:k:1];[1-3@TxHxW:power_of_2:(i,j,k)].
+# Currently though, the code does not support non-power-of-two strides. 
+# And conv3d only supports stride = 1 or stride = 2.
+
 
 STRIDE_conv_1 = 1
 STRIDE_conv_2 = (1, 2, 2)
@@ -51,13 +54,27 @@ filter_shape_3rd_conv = [C_out_3, C_in_3, 1, 1, 1] # C_out, C_in, Kd, Kh, Kw
 
 # --- CONCRETE INPUTS AND KERNELS --- only needed if operation is actually executed
 concrete_input = np.random.randn(C_in_1, T, H, W)  # input frames, [C_in, D_in, H_in, W_in]
-concrete_filter_expand_conv = np.random.randn(filter_shape_1st_conv[0], filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4])
-concrete_filter_depth_conv = np.random.randn(filter_shape_2nd_conv[0], filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3])
-concrete_filter_project_conv = np.random.randn(filter_shape_3rd_conv[0], filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4])
 
-concrete_bias_expand_conv  = np.broadcast_to(np.random.randn(C_out_1)[:, None, None, None], (C_out_1, T, H, W)).copy()
-concrete_bias_depth_conv   = np.broadcast_to(np.random.randn(C_out_2)[:, None, None, None], (C_out_2, T, H//2, W//2)).copy()
-concrete_bias_project_conv = np.broadcast_to(np.random.randn(C_out_3)[:, None, None, None], (C_out_3, T, H//2, W//2)).copy()
+concrete_filter_expand_conv = np.concatenate([
+    np.random.randn(C_out_1_unpadded, filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4]),
+    np.zeros((C_out_1-C_out_1_unpadded, filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4]))
+    ])
+concrete_filter_depth_conv = np.concatenate([
+    np.random.randn(C_out_2_unpadded, filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3]),
+    np.zeros((C_out_2-C_out_2_unpadded, filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3]))
+    ])
+concrete_filter_project_conv = np.concatenate([
+    np.random.randn(C_out_3_unpadded, filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4]),
+    np.zeros((C_out_3-C_out_3_unpadded, filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4]))
+    ])
+
+zero_pad_bias_expand_conv = np.concatenate([np.random.randn(C_out_1_unpadded), np.zeros(C_out_1-C_out_1_unpadded)])
+zero_pad_bias_depth_conv = np.concatenate([np.random.randn(C_out_2_unpadded), np.zeros(C_out_2-C_out_2_unpadded)])
+zero_pad_bias_project_conv = np.concatenate([np.random.randn(C_out_3_unpadded), np.zeros(C_out_3-C_out_3_unpadded)])
+
+concrete_bias_expand_conv  = np.broadcast_to(zero_pad_bias_expand_conv[:, None, None, None], (C_out_1, T, H, W)).copy()
+concrete_bias_depth_conv   = np.broadcast_to(zero_pad_bias_depth_conv[:, None, None, None], (C_out_2, T, H//2, W//2)).copy()
+concrete_bias_project_conv = np.broadcast_to(zero_pad_bias_project_conv[:, None, None, None], (C_out_3, T, H//2, W//2)).copy()
 
 # --- CREATE TENSOR OPERATIONS ---
 # group_pad here pads 5*28*28 = 3920 to 4096
@@ -98,7 +115,7 @@ kernel = LayoutAssignment(output_project_conv, args).run()
 for k in kernel.post_order():
     print(k)
 
-# --- LOWERING --- BE WARNED: THIS TAKES AGES 
+# --- LOWERING --- BE WARNED: THIS TAKES A WHILE
 circuit_ir = Lower(kernel).run()
 inputs = {"input": concrete_input, "filter_expand_conv": concrete_filter_expand_conv, 
           "filter_depth_conv": concrete_filter_depth_conv, "filter_project_conv": concrete_filter_project_conv, 
