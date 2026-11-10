@@ -17,6 +17,9 @@ Key Concepts:
   positions padded to 256). The skipped offsets come from separate dims of the
   same tensor dims, e.g. ``[2:2:1][3:2:1];[1-3@5x14x14:256:(1,2,2)]`` puts each
   (H, W) parity class in its own ciphertext
+- Permuted group dimension: a group whose axes are not in tensor-dim order,
+  e.g. ``[(2,1,3)@14x5x14:1024:1]`` holds dims 1..3 with H outermost, then T,
+  then W innermost. Extents and steps are listed in the same (layout) order
 """
 
 from math import ceil
@@ -53,9 +56,11 @@ class Dim:
         stride: The step size when indexing through this dimension (must be power of 2)
         dim_type: Whether this dimension is FILL or EMPTY
         group: For a group dimension, the logical extents of the grouped tensor
-            dims (``dim`` is then the tuple of grouped dim indices); else None
+            dims (``dim`` is then the tuple of grouped dim indices, outermost
+            first, in the order the group lays them out); else None
         steps: For a group dimension, how far each grouped axis jumps per
-            step of the group (all 1 for a plain group); else None
+            step of the group (all 1 for a plain group), in the order of
+            ``dim``; else None
     """
 
     def __init__(
@@ -90,6 +95,7 @@ class Dim:
             assert self.dim is None
         if self.group is not None:
             assert isinstance(self.dim, tuple) and len(self.dim) == len(self.group)
+            assert len(set(self.dim)) == len(self.dim), f"repeated group dim {self.dim}"
             assert len(self.steps) == len(self.group), (self.steps, self.group)
             # a step's skipped offsets are held by a dim of extent ``step``,
             # and dim extents are powers of 2
@@ -99,7 +105,7 @@ class Dim:
         assert self.stride > 0
 
     @staticmethod
-    def group_dim(start, logical_extents, extent, stride=1, steps=None):
+    def group_dim(start, logical_extents, extent, stride=1, steps=None, order=None):
         """Group dims ``start..start+len(logical_extents)-1`` into one dimension.
 
         Position ``p`` of the group holds the element whose indices in the
@@ -108,9 +114,36 @@ class Dim:
         Other dims of the same tensor dims add their index on top, e.g. the
         ``[2:2:1]`` in ``[2:2:1];[1-3@5x14x14:256:(1,2,2)]`` picks the H parity.
         Indices past the logical extents are padding too.
+
+        ``logical_extents`` and ``steps`` are given per tensor dim (dim
+        ``start + k`` at index ``k``). ``order`` lists the grouped dims from
+        outermost to innermost (default ``start, start+1, ..``), e.g. order
+        (2, 1, 3) unravels positions over (H, T, W).
         """
         dims = tuple(range(start, start + len(logical_extents)))
-        return Dim(dims, extent, stride, group=logical_extents, steps=steps)
+        steps = (1,) * len(dims) if steps is None else tuple(steps)
+        assert len(steps) == len(dims), (steps, dims)
+        order = dims if order is None else tuple(int(d) for d in order)
+        assert sorted(order) == list(dims), (
+            f"group order {order} is not a permutation of dims {dims}"
+        )
+        at = {d: k for k, d in enumerate(dims)}
+        return Dim.group_of(
+            order,
+            [logical_extents[at[d]] for d in order],
+            extent,
+            stride,
+            [steps[at[d]] for d in order],
+        )
+
+    @staticmethod
+    def group_of(dims, logical_extents, extent, stride=1, steps=None):
+        """Group ``dims`` (outermost first) into one dimension.
+
+        Like ``group_dim``, but ``logical_extents`` and ``steps`` are given in
+        the order of ``dims``, i.e. the layout order (as printed).
+        """
+        return Dim(tuple(dims), extent, stride, group=logical_extents, steps=steps)
 
     @property
     def is_group(self):
@@ -123,9 +156,20 @@ class Dim:
         return self.is_group and any(s > 1 for s in self.steps)
 
     @property
+    def is_permuted(self):
+        """Whether this is a group dimension whose axes are not in ascending order"""
+        return self.is_group and list(self.dim) != sorted(self.dim)
+
+    @property
     def group_counts(self):
         """Number of positions the group walks per axis: ``ceil(extent / step)``"""
         return tuple(ceil(e / s) for e, s in zip(self.group, self.steps))
+
+    def per_dim(self, values):
+        """Reorder ``values`` (one per axis of this group, in layout order) by
+        ascending tensor dim, e.g. ``per_dim(self.group)`` of
+        ``[(2,1,3)@14x5x14:1024:1]`` is ``(5, 14, 14)``."""
+        return tuple(v for _, v in sorted(zip(self.dim, values)))
 
     def __hash__(self):
         """Hash the dimension"""
@@ -152,6 +196,9 @@ class Dim:
         - "[a-b@e_a x .. x e_b:n:s]" -> group of dims a..b (see ``Dim.group_dim``)
         - "[a-b@e_a x .. x e_b:n:(t_a, .., t_b)]" -> stepped group, stride 1
         - "[a-b@e_a x .. x e_b:n:s:(t_a, .., t_b)]" -> stepped group, stride s
+        - "[(i, j, ..)@e_i x e_j x ..:n:..]" -> group laid out in the order
+          i, j, .. (outermost first), with the same suffixes as above; extents
+          and steps follow that order
         """
         terms = string_repr.replace("[", "").replace("]", "").split(":")
 
@@ -191,12 +238,17 @@ class Dim:
     @staticmethod
     def _parse_group(head, extent, stride, steps):
         dims, extents = head.split("@")
-        start, end = (int(d) for d in dims.split("-"))
+        dims = dims.strip()
+        if dims.startswith("("):
+            dims = [int(d) for d in dims.strip("()").split(",")]
+        else:
+            start, end = (int(d) for d in dims.split("-"))
+            dims = list(range(start, end + 1))
         group = [int(e) for e in extents.split("x")]
-        assert len(group) == end - start + 1, (head, group)
+        assert len(group) == len(dims), (head, group)
         if steps is not None:
             steps = [int(t) for t in steps.strip().strip("()").split(",")]
-        return Dim.group_dim(start, group, int(extent), int(stride), steps)
+        return Dim.group_of(dims, group, int(extent), int(stride), steps)
 
     def __repr__(self):
         """String representation of the dimension"""
@@ -204,7 +256,13 @@ class Dim:
             case DimType.FILL:
                 if self.is_group:
                     group = "x".join(str(e) for e in self.group)
-                    head = f"[{self.dim[0]}-{self.dim[-1]}@{group}:{self.extent}"
+                    first, last = self.dim[0], self.dim[-1]
+                    if self.dim == tuple(range(first, last + 1)):
+                        dims = f"{first}-{last}"
+                    else:
+                        # laid out in this order, outermost first
+                        dims = "(" + ",".join(str(d) for d in self.dim) + ")"
+                    head = f"[{dims}@{group}:{self.extent}"
                     if not self.is_stepped:
                         return f"{head}:{self.stride}]"
                     steps = "(" + ",".join(str(t) for t in self.steps) + ")"

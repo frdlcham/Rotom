@@ -13,6 +13,10 @@ steps skip get their own (outermost) dims, e.g. steps (1, 2, 2) give
 parity class. That is the packing in which a stride-2 conv only needs uniform
 rotations.
 
+With ``order`` the group lays the grouped dims out in that order instead,
+e.g. order (2, 1, 3) gives ``[(2,1,3)@14x5x14:1024:1]`` (H outermost, W
+innermost). Steps and residue dims work the same way.
+
 The elements are moved into the group dim by the staged repack of
 ``util.flatten_repack``.
 
@@ -121,7 +125,7 @@ def gen_group_pad(term, cs_kernels, logical_shape):
     assert extent >= positions and extent & (extent - 1) == 0, (
         f"GROUP_PAD extent {extent} must be a power of 2 >= {positions}"
     )
-    group = Dim.group_dim(start, group_shape, extent, steps=steps)
+    group = Dim.group_dim(start, group_shape, extent, steps=steps, order=args.order)
 
     kernels = {}
     for cs_kernel in cs_kernels:

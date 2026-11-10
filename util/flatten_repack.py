@@ -433,11 +433,12 @@ def depthwise_repack_plan_for_kernel(kernel):
     groups = [d for d in in_layout.get_dims() if d.is_group]
     if not groups:
         return None
-    # gen_depthwise_conv3d only accepts groups over exactly dims 1..3, so the
-    # group holds the logical input [D, H, W]; the filter is [C, Kd, Kh, Kw].
+    # gen_depthwise_conv3d only accepts groups over exactly dims 1..3 (in any
+    # order), so the group holds the logical input [D, H, W]; the filter is
+    # [C, Kd, Kh, Kw].
     term = kernel.layout.term
     f_shape = get_term_shape(term.cs[1])
-    in_shape = [int(f_shape[0])] + [int(e) for e in groups[0].group]
+    in_shape = [int(f_shape[0])] + [int(e) for e in groups[0].per_dim(groups[0].group)]
     out_dhw, _ = Conv3dArgs.depthwise_geometry(
         in_shape[1:], f_shape[1:], term.cs[2], term.cs[3]
     )

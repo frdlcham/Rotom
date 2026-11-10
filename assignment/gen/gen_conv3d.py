@@ -344,15 +344,18 @@ def _stepped_depthwise_out_layout(term, layout, out_dhw, strides):
     they index ciphertexts). Returns None when the steps don't match.
     """
     groups = [d for d in layout.get_dims() if d.is_group]
-    if any(tuple(d.steps) != tuple(int(s) for s in strides) for d in groups):
+    strides = tuple(int(s) for s in strides)
+    if any(d.per_dim(d.steps) != strides for d in groups):
         return None
-    if any(list(d.group_counts) != list(out_dhw) for d in groups):
+    if any(list(d.per_dim(d.group_counts)) != list(out_dhw) for d in groups):
         return None
     axes = stepped_axes(layout.get_dims())
     dims = []
     for d in layout.get_dims():
         if d.is_group:
-            dims.append(Dim.group_dim(1, out_dhw, d.extent, d.stride))
+            dims.append(
+                Dim.group_dim(1, out_dhw, d.extent, d.stride, order=d.dim)
+            )
         elif is_residue_dim(d, axes):
             dims.append(Dim(None, d.extent, 1, DimType.EMPTY))
         else:
@@ -363,7 +366,8 @@ def _stepped_depthwise_out_layout(term, layout, out_dhw, strides):
 def _grouped_depthwise_out_layouts(term, layout, out_dhw, strides):
     """Output layouts of a depthwise Conv3D on a GROUP_PAD input.
 
-    The input group must hold exactly dims 1..3. When the output keeps the input
+    The input group must hold exactly dims 1..3, in any order; the output
+    group keeps that order. When the output keeps the input
     size (stride 1, "same") it keeps the input layout and every tap is a uniform
     rotation along the group (across residue classes for a stepped group).
     Otherwise a group cannot leave gaps for the dropped voxels: the output gets a
@@ -374,11 +378,16 @@ def _grouped_depthwise_out_layouts(term, layout, out_dhw, strides):
     ``_stepped_depthwise_out_layout`` when its steps equal the strides.
     """
     groups = [d for d in layout.get_dims() if d.is_group]
-    if any(d.dim != (1, 2, 3) for d in groups):
+    if any(sorted(d.dim) != [1, 2, 3] for d in groups):
         return []
-    if list(groups[0].group) == list(out_dhw):
+    order = groups[0].dim
+    if any(d.dim != order for d in groups):
+        return []
+    if list(groups[0].per_dim(groups[0].group)) == list(out_dhw):
         return [Layout(term, [], copy(layout.get_dims()), layout.n, layout.secret)]
-    group = Dim.group_dim(1, out_dhw, round_to_ceiling_power_of_2(prod(out_dhw)))
+    group = Dim.group_dim(
+        1, out_dhw, round_to_ceiling_power_of_2(prod(out_dhw)), order=order
+    )
     layouts = {}
     if groups[0].is_stepped:
         aligned = _stepped_depthwise_out_layout(term, layout, out_dhw, strides)
@@ -401,7 +410,7 @@ def gen_depthwise_conv3d(term, cs_kernels, shapes):
     single uniform rotation per ciphertext (plus boundary masks). Lowering is
     correct for any resulting layout; alignment only affects rotation count.
 
-    A GROUP_PAD input (one group over dims 1..3) is handled by
+    A GROUP_PAD input (one group over dims 1..3, in any order) is handled by
     ``_grouped_depthwise_out_layouts``.
     """
     args = Conv3dArgs.from_term(term)

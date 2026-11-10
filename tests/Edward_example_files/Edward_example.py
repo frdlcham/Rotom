@@ -37,6 +37,9 @@ C_out_3 = 64
 
 # If you have a conv with stride = (i, j, k), it can be useful to group_pad(1, 3, steps=(i, j, k)), 
 # because this then does the parity layout stuff. 
+# are these steps related to group_pad?
+# could also not group, just change the steps for the specific dimensions
+
 # I don't think these steps all need to be powers of two, 
 # since they become the middle number in the outer brackets: [1:i:1][2:j:1][3:k:1];[1-3@TxHxW:power_of_2:(i,j,k)].
 # Currently though, the code does not support non-power-of-two strides. 
@@ -78,7 +81,7 @@ concrete_bias_project_conv = np.broadcast_to(zero_pad_bias_project_conv[:, None,
 
 # --- CREATE TENSOR OPERATIONS ---
 # group_pad here pads 5*28*28 = 3920 to 4096
-input = TensorTerm.Tensor("input", [C_in_1, T, H, W], True).group_pad(1, 3, steps=(1, 2, 2))  #input ciphertext matrix
+input = TensorTerm.Tensor("input", [C_in_1, T, H, W], True).group_pad(order=(2, 3, 1), steps=(1, 2, 2))  # steps are in order 1, 2, 3
 filter_expand_conv = TensorTerm.Tensor("filter_expand_conv", filter_shape_1st_conv, False)  # filter plaintext matrix
 bias_expand_conv = TensorTerm.Tensor("bias_expand_conv", [C_out_1, T, H, W], False)  # bias plaintext vector
 

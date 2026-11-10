@@ -488,10 +488,11 @@ class TensorTerm:
 
     def group_pad(
         self,
-        start: int,
-        end: int,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
         extent: Optional[int] = None,
         steps: Optional[Sequence[int]] = None,
+        order: Optional[Sequence[int]] = None,
         layout=None,
     ) -> "TensorTerm":
         """Pad dimensions ``start..end`` (inclusive) together instead of one by one.
@@ -509,13 +510,22 @@ class TensorTerm:
         ciphertext per (H, W) parity, each holding a 5x7x7 grid. That is the
         packing in which a stride-2 conv needs only uniform rotations.
 
+        With ``order``, the group lays the grouped dims out in that order
+        (outermost first) instead of ``start..end``, e.g. order (2, 1, 3)
+        gives ``[(2,1,3)@14x5x14:1024:1]``: H outermost, then T, W innermost.
+
         Args:
             start (int): First dimension to group
             end (int): Last dimension to group (inclusive)
             extent (int, optional): Padded extent of the group, a power of 2 at
                 least the number of grouped positions. Defaults to the smallest one.
             steps (sequence of int, optional): Per-dim step inside the group,
-                one power of 2 per grouped dim. Defaults to all 1.
+                one power of 2 per grouped dim, indexed like the tensor dims
+                (``steps[k]`` is the step of dim ``start + k``, whatever the
+                ``order``). Defaults to all 1.
+            order (sequence of int, optional): Permutation of ``start..end``
+                giving the layout order of the grouped dims, outermost first.
+                Defaults to ``start..end``.
             layout (str, optional): Tensor layout string for the result
 
         Returns:
@@ -523,15 +533,24 @@ class TensorTerm:
 
         Example:
             >>> b = a.group_pad(1, 3)  # [C, T, H, W], with T*H*W padded as a whole
+            >>> b = a.group_pad(order=(2, 1, 3))  # same, laid out H, T, W
         """
+        if start is None and end is None and order is not None:
+            start = min(order)
+            end = max(order)
         assert 0 <= start < end, f"group_pad expects start < end, got {start}, {end}"
         if steps is not None:
             steps = tuple(int(s) for s in steps)
             assert len(steps) == end - start + 1, (
                 f"group_pad expects one step per grouped dim, got {steps}"
             )
+        if order is not None:
+            order = tuple(int(d) for d in order)
+            assert sorted(order) == list(range(start, end + 1)), (
+                f"group_pad order {order} is not a permutation of dims {start}..{end}"
+            )
         return TensorTerm(
-            TensorOp.GROUP_PAD, [self, start, end, extent, steps], layout
+            TensorOp.GROUP_PAD, [self, start, end, extent, steps, order], layout
         )
 
     def permute(self, dim_map, layout=None):

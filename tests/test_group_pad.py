@@ -204,6 +204,95 @@ class TestSteppedGroupPadToy:
             x.group_pad(1, 3, steps=(2, 2))
 
 
+class TestPermutedGroupDim:
+    """Groups that lay their dims out in another order, e.g. (H, T, W)."""
+
+    def test_string_forms(self):
+        layout = Layout.from_string("[0:4:1][(2, 1, 3)@14x5x14:1024:1]", 4096)
+        assert layout.layout_str() == "[0:4:1][(2,1,3)@14x5x14:1024:1]"
+        (group,) = _group_dims(layout)
+        assert group.dim == (2, 1, 3) and group.group == (14, 5, 14)
+        assert group.is_permuted
+        assert group == Dim.group_dim(1, [5, 14, 14], 1024, order=(2, 1, 3))
+        assert group != Dim.group_dim(1, [5, 14, 14], 1024)
+        # the default order prints as before
+        assert not Dim.group_dim(1, [5, 14, 14], 1024, order=(1, 2, 3)).is_permuted
+        assert str(Dim.group_dim(1, [5, 14, 14], 1024, order=(1, 2, 3))) == (
+            "[1-3@5x14x14:1024:1]"
+        )
+
+    def test_stepped_string_forms(self):
+        # steps are given per tensor dim and printed in layout order
+        group = Dim.group_dim(1, [5, 14, 14], 256, steps=(1, 2, 4), order=(3, 1, 2))
+        assert str(group) == "[(3,1,2)@14x5x14:256:(4,1,2)]"
+        assert group.group_counts == (4, 5, 7)
+        layout = Layout.from_string("[3:4:1][2:2:1];" + str(group), 256)
+        assert layout.layout_str() == "[3:4:1][2:2:1];[(3,1,2)@14x5x14:256:(4,1,2)]"
+        split = Layout.from_string("[(3,1,2)@14x5x14:512:(4,1,2)]", 256)
+        assert split.layout_str() == (
+            "[(3,1,2)@14x5x14:2:256:(4,1,2)];[(3,1,2)@14x5x14:256:(4,1,2)]"
+        )
+        again = Layout.from_string(split.layout_str(), 256)
+        assert again.layout_str() == split.layout_str()
+
+    def test_apply_layout_follows_order(self):
+        x = np.arange(2 * 3 * 2 * 3, dtype=np.float64).reshape(2, 3, 2, 3)
+        layout = Layout.from_string("[0:2:1][(2,1,3)@2x3x3:32:1]", 64)
+        (ct,) = apply_layout(x, layout)
+        expected = np.zeros((2, 32))
+        expected[:, :18] = x.transpose(0, 2, 1, 3).reshape(2, 18)
+        np.testing.assert_array_equal(np.array(ct).reshape(2, 32), expected)
+
+    def test_order_must_be_permutation(self):
+        x = TensorTerm.Tensor("x", [2, 3, 6, 6], True)
+        with pytest.raises(AssertionError):
+            x.group_pad(1, 3, order=(1, 2, 4))
+        with pytest.raises(AssertionError):
+            x.group_pad(1, 3, order=(1, 1, 3))
+
+
+class TestPermutedGroupPadToy:
+    _run = TestGroupPadToy._run
+
+    def _check(self, shape, n, backend, order, **kwargs):
+        args = get_default_args()
+        args.n = n
+        rng = np.random.default_rng(0)
+        inputs = {"x": rng.normal(size=shape)}
+        x = TensorTerm.Tensor("x", list(shape), True)
+        kernel = self._run(
+            x.group_pad(1, 3, order=order, **kwargs), inputs, args, backend
+        )
+        assert kernel.op == KernelOp.GROUP_PAD
+        assert {d.dim for d in _group_dims(kernel.layout)} == {tuple(order)}
+        return kernel
+
+    def test_permuted_group_pad(self, backend):
+        kernel = self._check((2, 3, 5, 6), 256, backend, (2, 1, 3))
+        assert {d.group for d in _group_dims(kernel.layout)} == {(5, 3, 6)}
+
+    def test_permuted_group_pad_spans_ciphertexts(self, backend):
+        self._check((4, 3, 6, 7), 256, backend, (3, 2, 1))
+
+    def test_permuted_stepped_group_pad(self, backend):
+        kernel = self._check((2, 3, 6, 6), 256, backend, (2, 1, 3), steps=(1, 2, 2))
+        assert {d.steps for d in _group_dims(kernel.layout)} == {(2, 1, 2)}
+
+    def test_permuted_group_into_conv3d(self, backend):
+        args = get_default_args()
+        args.n = 256
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=(2, 3, 6, 6)),
+            "f": rng.normal(size=(4, 2, 3, 3, 3)),
+        }
+        x = TensorTerm.Tensor("x", [2, 3, 6, 6], True).group_pad(1, 3, order=(2, 1, 3))
+        f = TensorTerm.Tensor("f", [4, 2, 3, 3, 3], False)
+        kernel = self._run(TensorTerm.conv3d(x, f, 1, "same"), inputs, args, backend)
+        assert kernel.op == KernelOp.CONV3D
+        assert {d.dim for d in _group_dims(kernel.layout)} == {(2, 1, 3)}
+
+
 class TestGroupPadEdwardShape:
     def test_group_pad_saves_slots(self):
         """[4, 5, 14, 14]: 4 channels * 1024 fit one ciphertext instead of two."""
@@ -569,6 +658,79 @@ class TestSteppedDepthwiseConv3d:
             _, rots[steps], muls = _kernel_ops(out, 4096, KernelOp.DEPTHWISE_CONV3D)
         assert rots[(1, 2, 2)] == 5 * 3 * 3 - 1
         assert rots[(1, 2, 2)] < rots[None]
+
+
+class TestPermutedDepthwiseConv3d:
+    """DEPTHWISE_CONV3D on a group over dims 1..3 in any order keeps that order."""
+
+    ORDERS = [(2, 1, 3), (2, 3, 1), (3, 2, 1)]
+
+    def _check(self, order, c, shape, k_dhw, stride, n, backend, steps=None):
+        args = get_default_args()
+        args.n = n
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=[c] + shape),
+            "f": rng.normal(size=[c] + list(k_dhw)),
+        }
+        x = TensorTerm.Tensor("x", [c] + shape, True).group_pad(
+            1, 3, steps=steps, order=order
+        )
+        f = TensorTerm.Tensor("f", [c] + list(k_dhw), False)
+        out = TensorTerm.depthwise_conv3d(x, f, stride, "same")
+        kernel = TestGroupPadToy._run(self, out, inputs, args, backend)
+        (dw,) = [k for k in kernel.post_order() if k.op == KernelOp.DEPTHWISE_CONV3D]
+        assert {d.dim for d in _group_dims(dw.layout)} == {tuple(order)}
+        return dw
+
+    @pytest.mark.parametrize("order", ORDERS)
+    def test_stride1_keeps_input_layout(self, order, backend):
+        dw = self._check(order, 2, [3, 5, 6], (3, 3, 3), 1, 256, backend)
+        assert dw.layout.layout_str() == dw.cs[0].layout.layout_str()
+
+    @pytest.mark.parametrize("order", ORDERS)
+    def test_stride_1_2_2_repacks_to_smaller_group(self, order, backend):
+        dw = self._check(order, 2, [3, 6, 8], (3, 3, 3), (1, 2, 2), 256, backend)
+        (group,) = set(_group_dims(dw.layout))
+        assert group.per_dim(group.group) == (3, 3, 4)
+
+    @pytest.mark.parametrize("order", ORDERS)
+    def test_stepped_stride_1_2_2_aligned(self, order, backend):
+        from util.flatten_repack import depthwise_repack_plan_for_kernel
+
+        dw = self._check(
+            order, 2, [3, 6, 8], (3, 3, 3), (1, 2, 2), 256, backend, steps=(1, 2, 2)
+        )
+        assert depthwise_repack_plan_for_kernel(dw) is None
+        (group,) = set(_group_dims(dw.layout))
+        assert group.per_dim(group.group) == (3, 3, 4) and not group.is_stepped
+
+    def test_stride_1_2_2_group_spans_ciphertexts(self, backend):
+        self._check((3, 1, 2), 2, [3, 6, 7], (3, 3, 3), (1, 2, 2), 64, backend)
+
+    def test_expand_depthwise_project(self, backend):
+        """Edward_example structure with a permuted, stepped input group."""
+        args = get_default_args()
+        args.n = 1024
+        c_in, c, c_out, t, h, w = 2, 4, 2, 3, 6, 6
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=(c_in, t, h, w)),
+            "f1": rng.normal(size=(c, c_in, 1, 1, 1)),
+            "f2": rng.normal(size=(c, 3, 3, 3)),
+            "f3": rng.normal(size=(c_out, c, 1, 1, 1)),
+        }
+        x = TensorTerm.Tensor("x", [c_in, t, h, w], True).group_pad(
+            steps=(1, 2, 2), order=(2, 3, 1)
+        )
+        f1 = TensorTerm.Tensor("f1", [c, c_in, 1, 1, 1], False)
+        f2 = TensorTerm.Tensor("f2", [c, 3, 3, 3], False)
+        f3 = TensorTerm.Tensor("f3", [c_out, c, 1, 1, 1], False)
+        out = TensorTerm.conv3d(x, f1, 1, "same")
+        out = TensorTerm.depthwise_conv3d(out, f2, (1, 2, 2), "same")
+        out = TensorTerm.conv3d(out, f3, 1, "same")
+        kernel = TestGroupPadToy._run(self, out, inputs, args, backend)
+        assert {d.dim for d in _group_dims(kernel.layout)} == {(2, 3, 1)}
 
 
 class TestSteppedAdd:
