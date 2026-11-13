@@ -635,3 +635,295 @@ def lower_depthwise_conv3d(env, kernel):
         )
         cts = apply_repack_plan(cts, repack, n)
     return LayoutCiphertexts(layout=out_layout, cts=cts)
+
+
+# -----------------------------------------------------------------------------
+# Cost: the HE ops ``lower_conv3d`` emits, without building the circuit
+# -----------------------------------------------------------------------------
+
+_CONV3D_OPS_CACHE: dict = {}
+
+
+def _dereplicated(layout):
+    """``layout`` without its replicated ciphertext dims, and the map from each
+    ciphertext of ``layout`` to its ciphertext in the de-replicated layout.
+
+    ``lower_replicate`` hands every copy along a replicated ct dim the same
+    HETerm, so ops on those copies are shared in the circuit; working on one
+    copy also keeps the per-slot work of the cost model small.
+    """
+    num_ct = layout.num_ct()
+    rep = [
+        i
+        for i, d in enumerate(layout.ct_dims)
+        if d.dim is None and d.dim_type == DimType.FILL
+    ]
+    if not rep or layout.rolls:
+        return layout, list(range(num_ct))
+    keep = [i for i in range(len(layout.ct_dims)) if i not in rep]
+    digits = get_dim_indices(layout.ct_dims)
+    key = []
+    for ct in range(num_ct):
+        idx = 0
+        for i in keep:
+            idx = idx * layout.ct_dims[i].extent + digits[i][ct]
+        key.append(idx)
+    dims = [d for i, d in enumerate(layout.ct_dims) if i not in rep]
+    dims += list(layout.slot_dims)
+    return Layout(layout.term, [], dims, layout.n, layout.secret), key
+
+
+def _strided_filter_mask(n, d, h, w, rot, pad):
+    """Vectorized ``filter_masks`` entry of ``lower_conv3d`` (stride != 1, not grouped)."""
+    mask = np.ones(n, dtype=bool)
+    for (extent, stride), r, p in zip((d, h, w), rot, pad):
+        segment = extent * stride
+        covered = (n // segment) * segment
+        idx = np.arange(covered) % segment
+        shifted = idx + r - p * stride
+        mask[:covered] &= (shifted >= 0) & (shifted < segment)
+    return mask
+
+
+def conv3d_ops(kernel):
+    """HE ops of the circuit ``lower_conv3d`` emits for a CONV3D kernel.
+
+    Mirrors ``lower_conv3d`` step by step, tracking for every ciphertext only
+    whether it is zero, and counts what is left after the circuit opts
+    (``fused_circuit_opts``) and hash consing:
+
+    - a rotation by 0 is free; a rotation (or masked product) of the same
+      source ciphertext by the same amount (with the same mask) is shared;
+    - a multiplication by an all-ones mask is free; a tap without any source
+      slot (an explicit ZERO_MASK) is free, and so are adding and rotating it.
+      A product with an all-zero mask is *not* folded away by the circuit opts,
+      so it is still counted.
+
+    Returns:
+        dict: ``{"add": int, "mul": int, "rot": int}``
+    """
+    layout_a = kernel.cs[0].layout
+    layout_b = kernel.cs[1].layout
+    term = kernel.layout.term
+    key = (
+        layout_a.layout_str(),
+        layout_b.layout_str(),
+        kernel.layout.layout_str(),
+        layout_a.n,
+        str(term.cs[2]),
+        str(term.cs[3]),
+        str(term.cs[4]),
+        tuple(get_term_shape(kernel.cs[0].layout.term)),
+        tuple(get_term_shape(kernel.cs[1].layout.term)),
+    )
+    if key not in _CONV3D_OPS_CACHE:
+        _CONV3D_OPS_CACHE[key] = _conv3d_ops(kernel)
+    return dict(_CONV3D_OPS_CACHE[key])
+
+
+def _conv3d_ops(kernel):
+    layout_a = kernel.cs[0].layout
+    layout_b = kernel.cs[1].layout
+    term = kernel.layout.term
+    n = int(layout_a.n)
+    pad_front, _, pad_top, _, pad_left, _ = term.cs[4]
+    stride = int(term.cs[2])
+    a_shape = get_term_shape(kernel.cs[0].layout.term)
+
+    num_a = layout_a.num_ct()
+    unique_a, a_key = _dereplicated(layout_a)
+    grouped = any(dim.is_group for dim in layout_a.get_dims())
+
+    # filter taps of each filter ciphertext (taps in slots read as 0)
+    b_ct_dims = layout_b.ct_dims
+    digits = get_dim_indices(b_ct_dims)
+    pos = get_dim_map(b_ct_dims)
+    to_pos = {d.dim: pos[d] for d in b_ct_dims if d.dim is not None}
+
+    def tap(ct, filter_dim):
+        return digits[to_pos[filter_dim]][ct] if filter_dim in to_pos else 0
+
+    # filter ciphertexts that survive ``_keep_first_residue_class``
+    b_num_cts = layout_b.num_ct()
+    kept = list(range(b_num_cts))
+    if grouped and stride != 1:
+        axes = stepped_axes(layout_a.get_dims())
+        residue = [
+            i for i, d in enumerate(layout_a.ct_dims) if is_residue_dim(d, axes)
+        ]
+        if residue:
+            b_digits = get_dim_indices(layout_b.ct_dims)
+            kept = [
+                ct for ct in kept if all(b_digits[i][ct] == 0 for i in residue)
+            ]
+
+    ops = {"add": 0, "mul": 0, "rot": 0}
+    rots = set()
+    mask_muls = set()
+    tree_adds = set()
+    nonzero = {}
+
+    if grouped:
+        gather = _GroupedConv3dGather(
+            unique_a, [int(e) for e in a_shape[:4]], stride
+        )
+        for b in kept:
+            ak = a_key[min(b, num_a - 1)]
+            offsets = (
+                int(tap(b, 2)) - int(pad_front),
+                int(tap(b, 3)) - int(pad_top),
+                int(tap(b, 4)) - int(pad_left),
+            )
+            _, parts = gather.groups(ak, offsets)
+            nonzero[b] = bool(parts)
+            if not parts:
+                continue
+            terms = []
+            for c, r, m in parts:
+                if r != 0:
+                    rots.add((c, r))
+                if not m.all():
+                    mask_muls.add((c, r, m.tobytes()))
+                terms.append((c, r, m.tobytes()))
+            # ``_tree_sum``: equal partial sums are one HETerm (hash consing)
+            while len(terms) > 1:
+                paired = []
+                for i in range(0, len(terms), 2):
+                    if i + 1 < len(terms):
+                        paired.append((terms[i], terms[i + 1]))
+                        tree_adds.add(paired[-1])
+                    else:
+                        paired.append(terms[i])
+                terms = paired
+            ops["mul"] += 1  # * filter
+    else:
+        spatial = {}
+        offset = 1
+        for dim in layout_a.get_dims()[::-1]:
+            if dim.dim in (1, 2, 3) and dim.dim_type != DimType.EMPTY:
+                spatial[dim.dim] = (dim.extent, offset)
+            offset *= dim.extent
+        (d_ext, d_str), (h_ext, h_str), (w_ext, w_str) = (
+            spatial[1],
+            spatial[2],
+            spatial[3],
+        )
+        rot_offset = -pad_front * d_str - pad_top * h_str - pad_left * w_str
+        base_by_ct = None
+        if stride == 1:
+            plan = _get_apply_layout_plan(
+                unique_a, 4, layout_len=max(len(unique_a), unique_a.n)
+            )
+            base_by_ct = plan["base_indices_by_cts"]
+        masks = {}
+        for b in kept:
+            ak = a_key[min(b, num_a - 1)]
+            f_d, f_h, f_w = int(tap(b, 2)), int(tap(b, 3)), int(tap(b, 4))
+            rot_amt = f_d * d_str + f_h * h_str + f_w * w_str + rot_offset
+            mkey = (ak, f_d, f_h, f_w) if stride == 1 else (f_d, f_h, f_w)
+            if mkey not in masks:
+                if stride == 1:
+                    m = _slot_mask_conv3d_same_stride1(
+                        base_indices_ct=base_by_ct[ak],
+                        rot_amt=rot_amt,
+                        fd=f_d,
+                        fh=f_h,
+                        fw=f_w,
+                        pad_front=int(pad_front),
+                        pad_top=int(pad_top),
+                        pad_left=int(pad_left),
+                        din=int(a_shape[1]),
+                        hin=int(a_shape[2]),
+                        win=int(a_shape[3]),
+                        n=n,
+                    )
+                    m = np.asarray(m, dtype=bool)
+                else:
+                    m = _strided_filter_mask(
+                        n,
+                        (d_ext, d_str),
+                        (h_ext, h_str),
+                        (w_ext, w_str),
+                        (f_d * d_str, f_h * h_str, f_w * w_str),
+                        (int(pad_front), int(pad_top), int(pad_left)),
+                    )
+                masks[mkey] = bool(m.all())
+            all_set = masks[mkey]
+            # an all-zero mask is not folded away (``fused_circuit_opts`` only
+            # drops products with an explicit ZERO_MASK term), so it still costs
+            nonzero[b] = True
+            if rot_amt != 0:
+                rots.add((ak, rot_amt))
+            if not all_set:
+                mask_muls.add((ak, rot_amt, mkey))
+            ops["mul"] += 1  # * filter
+
+    ops["rot"] += len(rots)
+    ops["mul"] += len(mask_muls)
+    ops["add"] += len(tree_adds)
+
+    # sum over the filter ciphertext dims (C_in and taps): zeros are free
+    cts = LayoutCiphertexts(
+        layout=layout_b, cts={b: nonzero.get(b, False) for b in range(b_num_cts)}
+    )
+    dropped = set()
+    if grouped and stride != 1:
+        cts, dropped = _keep_first_residue_class(layout_a, cts)
+    filter_ct_dims = [
+        dim
+        for dim in cts.layout.ct_dims
+        if (dim.dim is not None and dim.dim != 0) and dim.dim_type == DimType.FILL
+    ]
+    filter_a_dims = [
+        a_dim
+        for i, (a_dim, b_dim) in enumerate(
+            zip(layout_a.get_dims(), layout_b.get_dims())
+        )
+        if i not in dropped and b_dim not in filter_ct_dims
+    ]
+    for ct_sum_dim in filter_ct_dims:
+        if ct_sum_dim not in cts.layout.ct_dims:
+            continue
+        summed = {}
+        for i, group in enumerate(get_cts_by_dim(cts, ct_sum_dim)):
+            ops["add"] += max(sum(group) - 1, 0)
+            summed[i] = any(group)
+        cts = LayoutCiphertexts(
+            layout=create_layout_without_dims(cts.layout, [ct_sum_dim]), cts=summed
+        )
+    live = sum(cts.cts.values())
+
+    # rotate-and-sum over the C_in slot dims
+    a_layout = Layout(layout_a.term, [], filter_a_dims, n, layout_a.secret)
+    while True:
+        _, slot_sum_dims = find_sum_dim(a_layout, 0)
+        if not slot_sum_dims:
+            break
+        slot_dim = min(
+            slot_sum_dims, key=lambda d: get_segment(d, a_layout.slot_dims)[2]
+        )
+        extent = get_segment(slot_dim, a_layout.slot_dims)[1]
+        steps = int(np.ceil(np.log2(extent))) if extent > 1 else 0
+        ops["rot"] += steps * live
+        ops["add"] += steps * live
+        a_layout = create_layout_without_dims(a_layout, [slot_dim])
+
+    # output masks
+    shape = Shape(kernel.layout.term)
+    shape.run()
+    logical_out_shape = shape.get_shape(kernel.layout.term)
+    if term.cs[3] == "valid" and logical_out_shape is not None:
+        _c_o, d_o, h_o, w_o = logical_out_shape
+        slot_dims = kernel.layout.slot_dims
+        idx = {
+            dim.dim: np.asarray(ind)
+            for dim, ind in zip(slot_dims, get_dim_indices(slot_dims))
+            if dim.dim_type != DimType.EMPTY and dim.dim in (1, 2, 3)
+        }
+        if 1 in idx and 2 in idx and 3 in idx:
+            ok = (idx[1] < d_o) & (idx[2] < h_o) & (idx[3] < w_o)
+            if not ok.all():
+                ops["mul"] += live
+    if any(dim.dim_type == DimType.EMPTY for dim in kernel.layout.slot_dims):
+        ops["mul"] += live
+    return ops

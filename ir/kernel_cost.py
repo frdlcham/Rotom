@@ -644,6 +644,24 @@ class KernelCost:
         ops["rot"] += int(math.sqrt(output_dim_len * int(math.log2(input_dim_len))))
         return ops
 
+    def conv3d_ops(self, ops):
+        """Calculate 3D convolution operations.
+
+        Counts the HE ops of the circuit ``lower_conv3d`` emits (per ciphertext,
+        after the circuit opts), see ``lower.lower_conv3d.conv3d_ops``.
+
+        Args:
+            ops: Dictionary of operation counts
+
+        Returns:
+            dict: Updated operation counts with convolution costs
+        """
+        from lower.lower_conv3d import conv3d_ops
+
+        for k, v in conv3d_ops(self.kernel).items():
+            ops[k] += v
+        return ops
+
     # -------------------------------------------------------------------------
     # Aggregated operation counting across families
     # -------------------------------------------------------------------------
@@ -724,7 +742,7 @@ class KernelCost:
                     for k, v in plan.ops().items():
                         ops[k] += v
             case KernelOp.CONV3D:
-                ops = self.conv2d_ops(ops)
+                ops = self.conv3d_ops(ops)
             case KernelOp.ROLL:
                 ops = self.roll_ops(ops)
             case KernelOp.SPLIT_ROLL:

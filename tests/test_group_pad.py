@@ -585,8 +585,10 @@ class TestSteppedConv3d:
     def test_stride2_keeps_first_residue_class(self, backend):
         """Anchors o * 2 are residue class 0: output is a plain 2x3x3 group."""
         kernel = self._check(2, 3, 3, [4, 6, 6], 2, (2, 2, 2), 32, backend)
-        (group,) = set(_group_dims(kernel.layout))
-        assert group.group == (2, 3, 3) and not group.is_stepped
+        # the group may be split over ciphertexts and slots
+        groups = _group_dims(kernel.layout)
+        assert groups
+        assert all(g.group == (2, 3, 3) and not g.is_stepped for g in groups)
         assert not _residue_dims(kernel.layout)
 
     def test_stride2_odd_extents_group_spans_ciphertexts(self, backend):
