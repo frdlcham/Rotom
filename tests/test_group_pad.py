@@ -417,6 +417,32 @@ class TestGroupPadConv3d:
         out = TensorTerm.conv3d(depth, fp, 1, "same") + bp
         self._run(out, inputs, args, backend)
 
+    def test_compact_moves_group_piece_into_slots(self, backend):
+        """n=256 splits the 108 -> 128 group over ciphertexts and slots; the
+        COMPACT after the first conv moves its ciphertext piece into a gap and
+        must keep it a piece of the group."""
+        args = get_default_args()
+        args.n = 256
+        args.rolls = True
+        rng = np.random.default_rng(0)
+        inputs = {
+            "x": rng.normal(size=(4, 3, 6, 6)),
+            "f1": rng.normal(size=(8, 4, 1, 1, 1)),
+            "f2": rng.normal(size=(4, 8, 1, 1, 1)),
+        }
+        x = TensorTerm.Tensor("x", [4, 3, 6, 6], True).group_pad(1, 3)
+        f1 = TensorTerm.Tensor("f1", [8, 4, 1, 1, 1], False)
+        f2 = TensorTerm.Tensor("f2", [4, 8, 1, 1, 1], False)
+        out = TensorTerm.conv3d(TensorTerm.conv3d(x, f1, 1, "same"), f2, 1, "same")
+        kernel = self._run(out, inputs, args, backend)
+        compacts = [k for k in kernel.post_order() if k.op == KernelOp.COMPACT]
+        assert compacts
+        for k in compacts:
+            # every piece of the grouped dims is still a group dim
+            assert all(
+                d.is_group for d in k.layout.get_dims() if isinstance(d.dim, tuple)
+            )
+
 
 class TestGroupPadDepthwiseConv3d:
     """DEPTHWISE_CONV3D consuming a GROUP_PAD input produces a grouped output."""

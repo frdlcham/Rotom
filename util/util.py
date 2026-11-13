@@ -271,8 +271,11 @@ def next_non_empty_dim(dims):
 def split_dim(dim, extent):
     assert dim.extent > extent
     rem_extent = dim.extent // extent
-    split_1 = Dim(dim.dim, extent, rem_extent * dim.stride, dim.dim_type)
-    split_2 = Dim(dim.dim, rem_extent, dim.stride, dim.dim_type)
+    # keep group metadata: both pieces walk the same group (see ``Layout``)
+    split_1 = Dim(
+        dim.dim, extent, rem_extent * dim.stride, dim.dim_type, dim.group, dim.steps
+    )
+    split_2 = Dim(dim.dim, rem_extent, dim.stride, dim.dim_type, dim.group, dim.steps)
     return split_1, split_2
 
 

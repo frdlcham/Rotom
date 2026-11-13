@@ -21,6 +21,16 @@ from ir.roll import Roll
 from util.util import get_dim_map_by_dim, next_non_empty_dim, split_dim
 
 
+def _resized(dim, extent, stride):
+    """``dim`` with a new extent and stride, keeping its type and group metadata.
+
+    A piece of a group dimension still walks that group: dropping ``group`` /
+    ``steps`` would leave a malformed dim (a tuple ``dim`` that is not a group).
+    """
+    return Dim(dim.dim, extent, stride, dim.dim_type, dim.group, dim.steps)
+
+
+
 def compact_ct_dim(ct_dim, slot_dims):
     """Compacts a ciphertext dimension within slot dimensions.
 
@@ -67,13 +77,13 @@ def compact_ct_dim(ct_dim, slot_dims):
             else:
                 # if the gap dimension is smaller than the ct_extent,
                 # then compact a little and continue
-                new_slot_dim = Dim(ct_dim.dim, slot_dim.extent, ct_dim.stride)
+                new_slot_dim = _resized(ct_dim, slot_dim.extent, ct_dim.stride)
                 new_slot_dims.append(new_slot_dim)
                 ct_stride *= slot_dim.extent
             ct_extent //= slot_dim.extent
 
     if ct_extent > 1:
-        new_ct_dims.append(Dim(ct_dim.dim, ct_extent, ct_stride))
+        new_ct_dims.append(_resized(ct_dim, ct_extent, ct_stride))
     return new_ct_dims, new_slot_dims
 
 
@@ -132,7 +142,7 @@ def compaction_heuristic(ct_dims, slot_dims):
             # compact slot dimension with ct_dim
             if slot_dim.extent > ct_dim.extent:
                 split_slot_1, split_slot_2 = split_dim(slot_dim, ct_dim.extent)
-                new_ct_dim = Dim(ct_dim.dim, split_slot_1.extent, ct_dim.stride)
+                new_ct_dim = _resized(ct_dim, split_slot_1.extent, ct_dim.stride)
                 remaining_slot_dims.remove(slot_dim)
                 next_remaining_slot_dim = next_non_empty_dim(remaining_slot_dims[1:])
                 if (
@@ -166,7 +176,7 @@ def compaction_heuristic(ct_dims, slot_dims):
             else:
                 split_ct_1, split_ct_2 = split_dim(ct_dim, slot_dim.extent)
                 new_slot_dims.append(
-                    Dim(ct_dim.dim, split_ct_1.extent, split_ct_1.stride)
+                    _resized(ct_dim, split_ct_1.extent, split_ct_1.stride)
                 )
                 remaining_slot_dims.remove(slot_dim)
 

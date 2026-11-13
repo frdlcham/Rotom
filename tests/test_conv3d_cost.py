@@ -45,8 +45,8 @@ def _x(shape, group=None):
     return x if group is None else x.group_pad(1, 3, **group)
 
 
-def _conv(x, fshape, stride, padding="same"):
-    return TensorTerm.conv3d(x, TensorTerm.Tensor("f", fshape, False), stride, padding)
+def _conv(x, fshape, stride, padding="same", name="f"):
+    return TensorTerm.conv3d(x, TensorTerm.Tensor(name, fshape, False), stride, padding)
 
 
 CASES = {
@@ -85,6 +85,16 @@ CASES = {
     ),
     "group_stepped_3x3x3_stride2": (
         lambda: _conv(_x([2, 4, 8, 8], {"steps": (2, 2, 2)}), [4, 2, 3, 3, 3], 2),
+        256,
+    ),
+    # the second conv reads a COMPACT that moved a group piece into the slots
+    "group_chained_after_compact": (
+        lambda: _conv(
+            _conv(_x([4, 3, 6, 6], {}), [8, 4, 1, 1, 1], 1, name="f1"),
+            [4, 8, 1, 1, 1],
+            1,
+            name="f2",
+        ),
         256,
     ),
     "group_stepped_c_in_over_cts": (
