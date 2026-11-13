@@ -14,10 +14,11 @@ from frontends.tensor import TensorTerm
 from ir.analysis.shape import Shape
 from ir.dim import Dim
 from ir.kernel import KernelOp
+from ir.kernel_cost import KernelCost, is_client_side_group_pad
 from ir.layout import Layout
 from tests.conftest import assert_results_equal, run_compiler_and_backend
 from tests.test_util import get_default_args
-from util.flatten_repack import group_pad_plan_for_kernel
+from util.flatten_repack import group_pad_plan_for_kernel, repack_plan_for_kernel
 from util.layout_util import apply_layout
 
 
@@ -829,3 +830,38 @@ class TestSteppedEdwardChain:
         assert {d.steps for d in _group_dims(dw.cs[0].layout)} == {(1, 2, 2)}
         assert not any(d.is_stepped for d in _group_dims(dw.layout))
         assert not _residue_dims(dw.layout)
+
+
+class TestClientSideGroupPadCost:
+    """A GROUP_PAD of a secret input is done by the client before encrypting."""
+
+    def _group_pad(self, prog):
+        args = get_default_args()
+        args.n = 256
+        kernel = LayoutAssignment(prog, args).run()
+        gp = next(k for k in kernel.post_order() if k.op == KernelOp.GROUP_PAD)
+        return kernel, gp
+
+    def _conv(self, x):
+        f = TensorTerm.Tensor("f", [8, 4, 1, 1, 1], False)
+        return TensorTerm.conv3d(x.group_pad(1, 3), f, 1, "same")
+
+    def test_input_group_pad_is_free(self):
+        x = TensorTerm.Tensor("x", [4, 3, 6, 6], True)
+        kernel, gp = self._group_pad(self._conv(x))
+        assert is_client_side_group_pad(gp)
+        # the repack would cost HE ops and depth if done homomorphically
+        assert any(repack_plan_for_kernel(gp).ops().values())
+        assert repack_plan_for_kernel(gp).depth > 0
+        assert KernelCost(gp, "lan").ops() == {"add": 0, "mul": 0, "rot": 0}
+        assert KernelCost(gp, "lan").depth() == 0
+        # the client sends the group-padded ciphertexts, not the input's
+        assert gp.layout.num_ct_unique() != gp.cs[0].layout.num_ct_unique()
+        assert KernelCost(kernel, "lan").num_input_cts() == gp.layout.num_ct_unique()
+
+    def test_group_pad_after_computation_is_not_free(self):
+        x = TensorTerm.Tensor("x", [4, 3, 6, 6], True)
+        y = TensorTerm.Tensor("y", [4, 3, 6, 6], False)
+        _, gp = self._group_pad(self._conv(x * y))
+        assert not is_client_side_group_pad(gp)
+        assert KernelCost(gp, "lan").ops() == repack_plan_for_kernel(gp).ops()

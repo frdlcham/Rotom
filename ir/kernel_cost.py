@@ -14,10 +14,24 @@ find the cost of a kernel without materializing the entire kernel.
 import math
 
 from ir.dim import DimType
-from ir.kernel import KernelOp
+from ir.kernel import Kernel, KernelOp
 from util.util import get_slot_dims, prod
 
 from .layout_utils import dimension_merging
+
+
+def is_client_side_group_pad(kernel):
+    """Whether ``kernel`` is a GROUP_PAD applied directly to a secret input.
+
+    The client packs the input in the group-padded layout before encrypting
+    it, so the repack costs no HE ops and no depth, and the client sends the
+    ciphertexts of the GROUP_PAD layout instead of the input's.
+    """
+    return (
+        kernel.op == KernelOp.GROUP_PAD
+        and kernel.cs[0].op == KernelOp.TENSOR
+        and kernel.cs[0].layout.secret
+    )
 
 
 class KernelCost:
@@ -757,6 +771,8 @@ class KernelCost:
                 ops = self.shift_ops(ops)
             case KernelOp.COMPACT:
                 ops = self.compact_ops(ops)
+            case KernelOp.GROUP_PAD if is_client_side_group_pad(self.kernel):
+                ops = self.nops(ops)
             case KernelOp.FLATTEN_REPACK | KernelOp.GROUP_PAD:
                 ops = self.flatten_repack_ops(ops)
             case KernelOp.POLY_CALL:
@@ -776,6 +792,34 @@ class KernelCost:
     # Aggregate cost metrics (communication, op cost, total, depth)
     # -------------------------------------------------------------------------
 
+    def num_input_cts(self):
+        """Number of unique ciphertexts the client encrypts and sends.
+
+        One per secret input ciphertext. An input that is group padded on the
+        client (see ``is_client_side_group_pad``) is sent in its GROUP_PAD
+        layout instead; its own layout is only sent too if another kernel
+        reads it directly.
+        """
+        terms = self.kernel.post_order()
+        consumers = {}
+        for term in terms:
+            for cs in term.cs:
+                if isinstance(cs, Kernel):
+                    consumers.setdefault(cs, []).append(term)
+
+        total = 0
+        for term in terms:
+            if is_client_side_group_pad(term):
+                total += term.layout.num_ct_unique()
+            elif (
+                term.op == KernelOp.TENSOR or term.op == KernelOp.PUNCTURED_TENSOR
+            ) and term.layout.secret:
+                users = consumers.get(term, [])
+                if users and all(is_client_side_group_pad(u) for u in users):
+                    continue
+                total += term.layout.num_ct_unique()
+        return total
+
     def comm_cost(self):
         """Calculate communication cost for the kernel.
 
@@ -783,13 +827,7 @@ class KernelCost:
             float: Communication cost in milliseconds
         """
         cost_model = self.cost_model()
-        total_num_ct_real = 0
-        for term in self.kernel.post_order():
-            if (
-                term.op == KernelOp.TENSOR or term.op == KernelOp.PUNCTURED_TENSOR
-            ) and term.layout.secret:
-                total_num_ct_real += term.layout.num_ct_unique()
-        return cost_model["comm"] * total_num_ct_real
+        return cost_model["comm"] * self.num_input_cts()
 
     def real_comm_cost(self):
         """Calculate real communication cost for the kernel.
@@ -797,12 +835,7 @@ class KernelCost:
         Returns:
             float: Real communication cost in milliseconds
         """
-        total_num_ct_real = 0
-        for term in self.kernel.post_order():
-            if (
-                term.op == KernelOp.TENSOR or term.op == KernelOp.PUNCTURED_TENSOR
-            ) and term.layout.secret:
-                total_num_ct_real += term.layout.num_ct_unique()
+        total_num_ct_real = self.num_input_cts()
         if self.network == "lan":
             return 0.0096 * total_num_ct_real
         else:
@@ -881,6 +914,8 @@ class KernelCost:
                         pass
                     case KernelOp.MUL | KernelOp.ROLL | KernelOp.CONVERSION:
                         d += 1
+                    case KernelOp.GROUP_PAD if is_client_side_group_pad(term):
+                        pass
                     case KernelOp.FLATTEN_REPACK | KernelOp.GROUP_PAD:
                         from util.flatten_repack import repack_plan_for_kernel
 
