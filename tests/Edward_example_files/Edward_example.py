@@ -77,23 +77,23 @@ zero_pad_bias_depth_conv = np.concatenate([np.random.randn(C_out_2_unpadded), np
 zero_pad_bias_project_conv = np.concatenate([np.random.randn(C_out_3_unpadded), np.zeros(C_out_3-C_out_3_unpadded)])
 
 concrete_bias_expand_conv  = np.broadcast_to(zero_pad_bias_expand_conv[:, None, None, None], (C_out_1, T, H, W)).copy()
-concrete_bias_depth_conv   = np.broadcast_to(zero_pad_bias_depth_conv[:, None, None, None], (C_out_2, T, H//2, W//2)).copy()
-concrete_bias_project_conv = np.broadcast_to(zero_pad_bias_project_conv[:, None, None, None], (C_out_3, T, H//2, W//2)).copy()
+concrete_bias_depth_conv   = np.broadcast_to(zero_pad_bias_depth_conv[:, None, None, None], (C_out_2, T//STRIDE_conv_2[0], H//STRIDE_conv_2[1], W//STRIDE_conv_2[2])).copy()
+concrete_bias_project_conv = np.broadcast_to(zero_pad_bias_project_conv[:, None, None, None], (C_out_3, T//STRIDE_conv_2[0], H//STRIDE_conv_2[1], W//STRIDE_conv_2[2])).copy()
 
 # --- CREATE TENSOR OPERATIONS ---
 # group_pad here pads 5*28*28 = 3920 to 4096
 input = TensorTerm.Tensor("input", [C_in_1, T, H, W], True)  # input ciphertext matrix
 input_partial_opt = input.group_pad(order=(2, 3, 1))
-input_opt = input.group_pad(order=(2, 3, 1), steps=(1, 2, 2))  # steps are in order 1, 2, 3
+input_opt = input.group_pad(order=(2, 3, 1), steps=STRIDE_conv_2)  # steps are in order 1, 2, 3
 
 filter_expand_conv = TensorTerm.Tensor("filter_expand_conv", filter_shape_1st_conv, False)  # filter plaintext matrix
 bias_expand_conv = TensorTerm.Tensor("bias_expand_conv", [C_out_1, T, H, W], False)  # bias plaintext vector
 
 filter_depth_conv = TensorTerm.Tensor("filter_depth_conv", filter_shape_2nd_conv, False)  # filter plaintext matrix
-bias_depth_conv = TensorTerm.Tensor("bias_depth_conv", [C_out_2, T, H//2, W//2], False)  # bias plaintext vector
+bias_depth_conv = TensorTerm.Tensor("bias_depth_conv", [C_out_2, T//STRIDE_conv_2[0], H//STRIDE_conv_2[1], W//STRIDE_conv_2[2]], False)  # bias plaintext vector
 
 filter_project_conv = TensorTerm.Tensor("filter_project_conv", filter_shape_3rd_conv, False)  # filter plaintext matrix
-bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T, H//2, W//2], False)  # bias plaintext vector
+bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T//STRIDE_conv_2[0], H//STRIDE_conv_2[1], W//STRIDE_conv_2[2]], False)  # bias plaintext vector
 
 # --- EXPAND CONV ---
 output_expand_conv = TensorTerm.conv3d(input, filter_expand_conv, stride=STRIDE_conv_1, padding="same") + bias_expand_conv
