@@ -7,6 +7,8 @@ from frontends.tensor import TensorTerm
 from lower.lower import Lower
 from ir.kernel_cost import KernelCost
 
+from util.util import ceil_div
+
 # Conv3d in Rotom expects:
 #  input:  [C_in, D_in, H_in, W_in]   (secret)
 #  filter: [C_out, C_in, Kd, Kh, Kw] (public)
@@ -77,8 +79,8 @@ zero_pad_bias_depth_conv = np.concatenate([np.random.randn(C_out_2_unpadded), np
 zero_pad_bias_project_conv = np.concatenate([np.random.randn(C_out_3_unpadded), np.zeros(C_out_3-C_out_3_unpadded)])
 
 concrete_bias_expand_conv  = np.broadcast_to(zero_pad_bias_expand_conv[:, None, None, None], (C_out_1, T, H, W)).copy()
-concrete_bias_depth_conv   = np.broadcast_to(zero_pad_bias_depth_conv[:, None, None, None], (C_out_2, T//STRIDE_conv_2[0], H//STRIDE_conv_2[1], W//STRIDE_conv_2[2])).copy()
-concrete_bias_project_conv = np.broadcast_to(zero_pad_bias_project_conv[:, None, None, None], (C_out_3, T//STRIDE_conv_2[0], H//STRIDE_conv_2[1], W//STRIDE_conv_2[2])).copy()
+concrete_bias_depth_conv   = np.broadcast_to(zero_pad_bias_depth_conv[:, None, None, None], (C_out_2, ceil_div(T, STRIDE_conv_2[0]), ceil_div(H, STRIDE_conv_2[1]), ceil_div(W, STRIDE_conv_2[2]))).copy()
+concrete_bias_project_conv = np.broadcast_to(zero_pad_bias_project_conv[:, None, None, None], (C_out_3, ceil_div(T, STRIDE_conv_2[0]), ceil_div(H, STRIDE_conv_2[1]), ceil_div(W, STRIDE_conv_2[2]))).copy()
 
 # --- CREATE TENSOR OPERATIONS ---
 # group_pad here pads 5*28*28 = 3920 to 4096
@@ -90,10 +92,10 @@ filter_expand_conv = TensorTerm.Tensor("filter_expand_conv", filter_shape_1st_co
 bias_expand_conv = TensorTerm.Tensor("bias_expand_conv", [C_out_1, T, H, W], False)  # bias plaintext vector
 
 filter_depth_conv = TensorTerm.Tensor("filter_depth_conv", filter_shape_2nd_conv, False)  # filter plaintext matrix
-bias_depth_conv = TensorTerm.Tensor("bias_depth_conv", [C_out_2, T//STRIDE_conv_2[0], H//STRIDE_conv_2[1], W//STRIDE_conv_2[2]], False)  # bias plaintext vector
+bias_depth_conv = TensorTerm.Tensor("bias_depth_conv", [C_out_2, ceil_div(T, STRIDE_conv_2[0]), ceil_div(H, STRIDE_conv_2[1]), ceil_div(W, STRIDE_conv_2[2])], False)  # bias plaintext vector
 
 filter_project_conv = TensorTerm.Tensor("filter_project_conv", filter_shape_3rd_conv, False)  # filter plaintext matrix
-bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, T//STRIDE_conv_2[0], H//STRIDE_conv_2[1], W//STRIDE_conv_2[2]], False)  # bias plaintext vector
+bias_project_conv = TensorTerm.Tensor("bias_project_conv", [C_out_3, ceil_div(T, STRIDE_conv_2[0]), ceil_div(H, STRIDE_conv_2[1]), ceil_div(W, STRIDE_conv_2[2])], False)  # bias plaintext vector
 
 # --- EXPAND CONV ---
 output_expand_conv = TensorTerm.conv3d(input, filter_expand_conv, stride=STRIDE_conv_1, padding="same") + bias_expand_conv

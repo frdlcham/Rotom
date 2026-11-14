@@ -313,6 +313,9 @@ def max_levels(circuit_ir):
 def round_up(n):
     return int(np.ceil(n))
 
+def ceil_div(a, b):
+    return -(-a // b)
+
 
 def round_to_ceiling_power_of_2(n):
     if n < 1:
