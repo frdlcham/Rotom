@@ -37,7 +37,7 @@ from util.util import prod, round_to_ceiling_power_of_2
 # A candidate whose repack needs more than this many times the moves of the
 # cheapest candidate is dropped before its plan (one n-slot mask per move) is
 # built: misaligned input orders need about one move per element.
-MAX_MOVE_RATIO = 4
+MAX_MOVE_RATIO = 5
 
 
 def _in_range(dim, start, end):
@@ -149,6 +149,9 @@ def gen_group_pad(term, cs_kernels, logical_shape):
 
 def _drop_misaligned(kernels, logical_shape, start, end):
     """Keep the kernels within ``MAX_MOVE_RATIO`` of the cheapest repack."""
+    # There might be an issue here caused by the fact that it doesn't take into account what output_layout is gotten
+    # It could be better to ensure that per output layout, we keep the kernels within MAX_MOVE_RATIO of the cheapest repack
+    # There's also an issue with the fact that if this is calculation the initial repacking (client side) then any layout is "free", but this function will still discard many of them for being 'too expensive'
     if len(kernels) <= 1:
         return kernels
     counts = [
