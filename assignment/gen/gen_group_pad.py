@@ -97,6 +97,19 @@ def _compact_layout(term, layout, group, start, end):
     return Layout(term, [], dims, layout.n, layout.secret)
 
 
+def _alt_compact_layout(term, layout, group, start, end):
+    """Re-split all dims over ciphertexts and slots, filling the freed slots.
+
+    The residue dims of a stepped group go right before the group, e.g.
+    ``[0:2:16];[0:16:1][2:2:1][3:2:1][(2,3,1)@3x3x3:16:(2,2,1)]``.
+    """
+    dims = _replace_grouped(layout.get_dims(), group, start, end)
+    i = next(i for i, d in enumerate(dims) if d is group)
+    dims = dims[:i] + _residue_dims(group) + dims[i:]
+    dims = merge_dims(dims, set())
+    return Layout(term, [], dims, layout.n, layout.secret)
+
+
 def gen_group_pad(term, cs_kernels, logical_shape):
     """Generates layouts for group pad operations.
 
@@ -134,7 +147,7 @@ def gen_group_pad(term, cs_kernels, logical_shape):
         if layout.rolls or any(d.is_group for d in layout.get_dims()):
             continue
         cs_placeholder = Kernel(KernelOp.CS, [0], layout)
-        for make_layout in (_in_place_layout, _compact_layout):
+        for make_layout in (_in_place_layout, _compact_layout, _alt_compact_layout):
             new_layout = make_layout(term, layout, group, start, end)
             if new_layout is None:
                 continue
