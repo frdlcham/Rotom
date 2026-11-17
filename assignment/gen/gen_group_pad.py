@@ -36,8 +36,11 @@ from util.util import prod, round_to_ceiling_power_of_2
 
 # A candidate whose repack needs more than this many times the moves of the
 # cheapest candidate is dropped before its plan (one n-slot mask per move) is
-# built: misaligned input orders need about one move per element.
-MAX_MOVE_RATIO = 5
+# built
+# Sometimes I increase this value when new candidates are thrown away even though I believe their output layout may be promising
+# TODO: figure out a better way to trim candidates away, something that is actually based on how useful the output layout is and 
+# not only on how difficult it is to obtain
+MAX_MOVE_RATIO = 13
 
 
 def _in_range(dim, start, end):
