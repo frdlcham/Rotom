@@ -72,7 +72,9 @@ def add_replicated_dimensions_3d(a_shape, b_shape):
     # Replicate output channels and filter spatial dims onto the secret input layout.
     replicated_dims = []
     b_dims = []
-    c_out = b_shape[0]
+    # unpadded output channels (e.g. 184) are laid out padded to a power of 2;
+    # ciphertexts holding only padded channels are dead (see ``ir.liveness``)
+    c_out = round_to_ceiling_power_of_2(b_shape[0])
     c_in = b_shape[1]
     k_d, k_h, k_w = b_shape[2], b_shape[3], b_shape[4]
 
@@ -288,11 +290,12 @@ def gen_conv3d(term, cs_kernels, shapes):
         output_layout = Layout(
             term, [], output_dims, a_kernel.layout.n, a_kernel.layout.secret
         )
+        c_o_p2 = round_to_ceiling_power_of_2(b_shape[0])
         if grouped:
             # the group pads the spatial dims as a whole, they keep their extents
-            expected = [b_shape[0], d_o, h_o, w_o]
+            expected = [c_o_p2, d_o, h_o, w_o]
         else:
-            expected = [b_shape[0], d_o_p2, h_o_p2, w_o_p2]
+            expected = [c_o_p2, d_o_p2, h_o_p2, w_o_p2]
         if _materialized_tensor_shape(output_layout) != expected:
             continue
 

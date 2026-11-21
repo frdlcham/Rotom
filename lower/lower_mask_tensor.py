@@ -1,4 +1,5 @@
 from ir.he import HEOp, HETerm
+from ir.liveness import dead_cts
 from util.shape_util import layout_to_shape_indices
 
 
@@ -21,7 +22,12 @@ def lower_punctured_tensor(kernel):
     if layout.ct_dims:
         cts = {}
         ct_indices = layout_to_shape_indices(layout)
+        # dead ciphertexts (only zero padding, e.g. padded filter rows)
+        dead = dead_cts(kernel)
         for i, _ in enumerate(ct_indices):
+            if i in dead:
+                cts[i] = HETerm(HEOp.ZERO_MASK, [], False)
+                continue
             cts[i] = HETerm(
                 HEOp.PUNCTURED_PACK,
                 [layout],

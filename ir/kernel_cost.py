@@ -15,6 +15,7 @@ import math
 
 from ir.dim import DimType
 from ir.kernel import Kernel, KernelOp
+from ir.liveness import num_live_cts, num_live_unique_cts
 from util.util import get_slot_dims, prod
 
 from .layout_utils import dimension_merging
@@ -214,7 +215,8 @@ class KernelCost:
         Returns:
             dict: Updated operation counts with addition operations
         """
-        ops["add"] += self.kernel.layout.num_ct()
+        # dead ciphertexts (only zero padding) are not computed
+        ops["add"] += num_live_cts(self.kernel)
         return ops
 
     def mul_arith_ops(self, ops):
@@ -226,7 +228,8 @@ class KernelCost:
         Returns:
             dict: Updated operation counts with multiplication operations
         """
-        ops["mul"] += self.kernel.layout.num_ct()
+        # dead ciphertexts (only zero padding) are not computed
+        ops["mul"] += num_live_cts(self.kernel)
         return ops
 
     # -------------------------------------------------------------------------
@@ -817,7 +820,8 @@ class KernelCost:
                 users = consumers.get(term, [])
                 if users and all(is_client_side_group_pad(u) for u in users):
                     continue
-                total += term.layout.num_ct_unique()
+                # dead ciphertexts (only zero padding) are not sent
+                total += num_live_unique_cts(term)
         return total
 
     def comm_cost(self):

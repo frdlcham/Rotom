@@ -23,6 +23,7 @@ from util.layout_util import (
     get_segment,
 )
 from util.shape_util import get_term_shape
+from ir.liveness import dead_cts
 
 
 def _slot_mask_conv3d_same_stride1(
@@ -256,8 +257,11 @@ def lower_conv3d(env, kernel):
         HETerm(HEOp.CS, [a_cts[ct_idx]], a_cts[ct_idx].secret)
         for ct_idx in sorted(a_cts.keys())
     ]
+    # a dead filter ciphertext stays a bare ZERO_MASK (see the tap loop below)
     b_cs = [
-        HETerm(HEOp.CS, [b_cts[ct_idx]], b_cts[ct_idx].secret)
+        b_cts[ct_idx]
+        if b_cts[ct_idx].op == HEOp.ZERO_MASK
+        else HETerm(HEOp.CS, [b_cts[ct_idx]], b_cts[ct_idx].secret)
         for ct_idx in sorted(b_cts.keys())
     ]
 
@@ -428,6 +432,12 @@ def lower_conv3d(env, kernel):
 
     cts = {}
     for b_idx, b_ct in enumerate(b_cs):
+        if b_ct.op == HEOp.ZERO_MASK:
+            # dead filter ciphertext (only zero padding): its taps are zero.
+            # Emit the ZERO_MASK itself, as the circuit opts do not fold a
+            # product with a ZERO_MASK (``conv3d_ops`` counts these as free)
+            cts[b_idx] = b_ct
+            continue
         if grouped:
             parts = []
             for c, r, m in grouped_taps[b_idx]:
@@ -745,7 +755,10 @@ def _conv3d_ops(kernel):
 
     # filter ciphertexts that survive ``_keep_first_residue_class``
     b_num_cts = layout_b.num_ct()
-    kept = list(range(b_num_cts))
+    # dead filter ciphertexts (only zero padding, e.g. padded output channels)
+    # are an explicit ZERO_MASK (``lower_punctured_tensor``): their taps are free
+    b_dead = dead_cts(kernel.cs[1])
+    kept = [ct for ct in range(b_num_cts) if ct not in b_dead]
     if grouped and stride != 1:
         axes = stepped_axes(layout_a.get_dims())
         residue = [

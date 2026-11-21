@@ -101,6 +101,36 @@ CASES = {
         lambda: _conv(_x([8, 3, 6, 6], {"steps": (1, 2, 2)}), [4, 8, 3, 3, 3], 1),
         64,
     ),
+    # unpadded channels: ciphertexts holding only padded channels are dead
+    "unpadded_c_out_over_cts": (
+        lambda: _conv(_x([4, 2, 4, 4]), [6, 4, 1, 1, 1], 1),
+        32,
+    ),
+    "unpadded_c_out_3x3x3": (
+        lambda: _conv(_x([2, 4, 4, 4]), [5, 2, 3, 3, 3], 1),
+        64,
+    ),
+    "unpadded_c_in_over_cts": (
+        lambda: _conv(_x([12, 2, 4, 4]), [4, 12, 1, 1, 1], 1),
+        128,
+    ),
+    "group_stepped_unpadded_c_out": (
+        lambda: _conv(_x([4, 3, 6, 6], {"steps": (1, 2, 2)}), [6, 4, 1, 1, 1], 1),
+        64,
+    ),
+    "group_stepped_unpadded_stride2": (
+        lambda: _conv(_x([2, 4, 8, 8], {"steps": (2, 2, 2)}), [3, 2, 3, 3, 3], 2),
+        64,
+    ),
+    "group_chained_unpadded": (
+        lambda: _conv(
+            _conv(_x([4, 3, 6, 6], {}), [6, 4, 1, 1, 1], 1, name="f1"),
+            [3, 6, 1, 1, 1],
+            1,
+            name="f2",
+        ),
+        64,
+    ),
 }
 
 

@@ -12,7 +12,9 @@ The ``Lower`` class is the single entrypoint used by tests and backends; any
 new kernel op should be wired in here with a corresponding ``lower_*`` helper.
 """
 
+from ir.he import HEOp, HETerm
 from ir.kernel import KernelOp
+from ir.liveness import dead_cts
 from lower.circuit_opts.combined_opts import fused_circuit_opts
 
 # replace with optimized cts
@@ -56,6 +58,39 @@ from lower.lower_tile import lower_tile
 from lower.lower_cumsum import lower_cumsum
 from lower.lower_avg_pool2d import lower_avg_pool2d
 from lower.lower_transpose import lower_transpose
+
+
+# ops whose dead output ciphertexts are replaced by an explicit ZERO_MASK, so
+# the circuit never computes what the cost model counts as free (the inputs'
+# dead ciphertexts are already zero in ``lower_tensor``/``lower_punctured_tensor``)
+_ZERO_DEAD_OPS = (
+    KernelOp.ADD,
+    KernelOp.SUB,
+    KernelOp.MUL,
+    KernelOp.CONV3D,
+    KernelOp.DEPTHWISE_CONV3D,
+)
+
+
+def _zero_dead_cts(kernel, layout_cts):
+    """Replace the dead ciphertexts of ``kernel`` (see ``ir.liveness``) by ZERO_MASK.
+
+    They only hold padding that is zero by construction, so this does not change
+    any value; it makes sure no ops are spent on them.
+    """
+    dead = dead_cts(kernel)
+    if not dead:
+        return layout_cts
+    assert set(layout_cts.keys()) == set(range(kernel.layout.num_ct())), (
+        kernel.op,
+        sorted(layout_cts.keys()),
+        kernel.layout.num_ct(),
+    )
+    cts = dict(layout_cts.cts)
+    for i in dead:
+        if cts[i].op != HEOp.ZERO_MASK:
+            cts[i] = HETerm(HEOp.ZERO_MASK, [], False)
+    return LayoutCiphertexts(layout=layout_cts.layout, cts=cts)
 
 
 class Lower:
@@ -150,6 +185,8 @@ class Lower:
                     self.env[term] = lower_poly_call(self.env, term)
                 case _:
                     raise NotImplementedError(term.op)
+            if term.op in _ZERO_DEAD_OPS:
+                self.env[term] = _zero_dead_cts(term, self.env[term])
 
     def opt(self):
         layout_cts = self.env[self.kernel]

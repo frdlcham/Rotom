@@ -123,11 +123,15 @@ class Kernel:
         Returns:
             str: Human-readable representation of the kernel
         """
+        from ir.liveness import live_layout_str
+
         layout = dimension_merging(self.layout)
+        # dead ciphertexts at the end (only padding) are left out
+        layout_str = live_layout_str(self, layout)
         if self.op == KernelOp.TENSOR or self.op == KernelOp.PUNCTURED_TENSOR:
-            return f"{self.op}: {self.layout.term.cs[0]} {layout.layout_str()}"
+            return f"{self.op}: {self.layout.term.cs[0]} {layout_str}"
         else:
-            return f"{self.op}: {layout.layout_str()}"
+            return f"{self.op}: {layout_str}"
 
     def copy(self):
         """Create a copy of the kernel.

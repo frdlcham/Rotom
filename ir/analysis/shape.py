@@ -301,8 +301,9 @@ class Shape:
                 logical_a = self.get_shape(args.input)
 
                 d_i, h_i, w_i = logical_a[1], logical_a[2], logical_a[3]
-                # Logical output channels (layout gen uses unpadded filter c_out).
-                c_o = logical_b[0]
+                # Output channels padded to a power of 2 (as in gen_conv3d);
+                # ciphertexts holding only padded channels are dead.
+                c_o = round_to_ceiling_power_of_2(logical_b[0])
                 # Use logical filter spatial sizes, not padded filter.
                 k_d, k_h, k_w = logical_b[2], logical_b[3], logical_b[4]
                 stride = args.stride

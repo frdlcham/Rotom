@@ -1,4 +1,5 @@
 from ir.he import HEOp, HETerm
+from ir.liveness import dead_cts
 from lower.layout_cts import LayoutCiphertexts
 from util.shape_util import get_term_shape, layout_to_shape_indices
 
@@ -16,10 +17,13 @@ def lower_tensor(kernel):
         # BUG: this is incorrect if the layout has rolls
         # and will cause zero masking to be applied to the wrong ciphertexts
         ct_indices = layout_to_shape_indices(layout)
+        # dead ciphertexts (only zero padding), see ``ir.liveness``
+        dead = dead_cts(kernel)
         for i, offset in enumerate(ct_indices):
             # HACK: this is a temporary fix to handle the case where the layout has rolls
-            if not layout.rolls and not all(
-                a < b for a, b in zip(offset, layout_shape)
+            if i in dead or (
+                not layout.rolls
+                and not all(a < b for a, b in zip(offset, layout_shape))
             ):
                 cts[i] = HETerm(HEOp.ZERO_MASK, [], False)
             else:
