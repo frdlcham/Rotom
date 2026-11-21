@@ -20,18 +20,13 @@ W = 28
 
 # Channels padded to powers of 2
 C_in_1 = 32 # channels input to first conv
-C_out_1_unpadded = 184
-C_out_1 = 256
+C_out_1 = 184
 
 C_in_2 = C_out_1
-C_in_2_unpadded = C_out_1_unpadded
-C_out_2_unpadded = C_in_2_unpadded
 C_out_2 = C_in_2 # 2nd conv keeps channels the same
 
 C_in_3 = C_out_2
-C_in_3_unpadded = C_out_2_unpadded
-C_out_3_unpadded = 56
-C_out_3 = 64
+C_out_3 = 56
 
 # Rules:
 
@@ -61,26 +56,13 @@ filter_shape_3rd_conv = [C_out_3, C_in_3, 1, 1, 1] # C_out, C_in, Kd, Kh, Kw
 # --- CONCRETE INPUTS AND KERNELS --- only needed if operation is actually executed
 concrete_input = np.random.randn(C_in_1, T, H, W)  # input frames, [C_in, D_in, H_in, W_in]
 
-concrete_filter_expand_conv = np.concatenate([
-    np.random.randn(C_out_1_unpadded, filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4]),
-    np.zeros((C_out_1-C_out_1_unpadded, filter_shape_1st_conv[1], filter_shape_1st_conv[2], filter_shape_1st_conv[3], filter_shape_1st_conv[4]))
-    ])
-concrete_filter_depth_conv = np.concatenate([
-    np.random.randn(C_out_2_unpadded, filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3]),
-    np.zeros((C_out_2-C_out_2_unpadded, filter_shape_2nd_conv[1], filter_shape_2nd_conv[2], filter_shape_2nd_conv[3]))
-    ])
-concrete_filter_project_conv = np.concatenate([
-    np.random.randn(C_out_3_unpadded, filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4]),
-    np.zeros((C_out_3-C_out_3_unpadded, filter_shape_3rd_conv[1], filter_shape_3rd_conv[2], filter_shape_3rd_conv[3], filter_shape_3rd_conv[4]))
-    ])
+concrete_filter_expand_conv = np.random.randn(*filter_shape_1st_conv)
+concrete_filter_depth_conv = np.random.randn(*filter_shape_2nd_conv)
+concrete_filter_project_conv = np.random.randn(*filter_shape_3rd_conv)
 
-zero_pad_bias_expand_conv = np.concatenate([np.random.randn(C_out_1_unpadded), np.zeros(C_out_1-C_out_1_unpadded)])
-zero_pad_bias_depth_conv = np.concatenate([np.random.randn(C_out_2_unpadded), np.zeros(C_out_2-C_out_2_unpadded)])
-zero_pad_bias_project_conv = np.concatenate([np.random.randn(C_out_3_unpadded), np.zeros(C_out_3-C_out_3_unpadded)])
-
-concrete_bias_expand_conv  = np.broadcast_to(zero_pad_bias_expand_conv[:, None, None, None], (C_out_1, T, H, W)).copy()
-concrete_bias_depth_conv   = np.broadcast_to(zero_pad_bias_depth_conv[:, None, None, None], (C_out_2, ceil_div(T, STRIDE_conv_2[0]), ceil_div(H, STRIDE_conv_2[1]), ceil_div(W, STRIDE_conv_2[2]))).copy()
-concrete_bias_project_conv = np.broadcast_to(zero_pad_bias_project_conv[:, None, None, None], (C_out_3, ceil_div(T, STRIDE_conv_2[0]), ceil_div(H, STRIDE_conv_2[1]), ceil_div(W, STRIDE_conv_2[2]))).copy()
+zero_pad_bias_expand_conv = np.random.randn(C_out_1, T, H, W)
+zero_pad_bias_depth_conv = np.random.randn(C_out_2, ceil_div(T, STRIDE_conv_2[0]), ceil_div(H, STRIDE_conv_2[1]), ceil_div(W, STRIDE_conv_2[2]))
+zero_pad_bias_project_conv = np.random.randn(C_out_3, ceil_div(T, STRIDE_conv_2[0]), ceil_div(H, STRIDE_conv_2[1]), ceil_div(W, STRIDE_conv_2[2]))
 
 # --- CREATE TENSOR OPERATIONS ---
 # group_pad here pads 5*28*28 = 3920 to 4096
