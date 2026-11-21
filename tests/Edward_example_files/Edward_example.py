@@ -18,7 +18,7 @@ T = 5
 H = 28
 W = 28
 
-# Channels padded to powers of 2
+# CHANNELS
 C_in_1 = 32 # channels input to first conv
 C_out_1 = 184
 

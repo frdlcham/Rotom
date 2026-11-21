@@ -15,20 +15,15 @@ H_W_array = [3, 6]
 
 # need ceil_div to deal with H = W not divisible by STRIDE_conv_2[1] = STRIDE_conv_2[2]
 
-# Channels padded to powers of 2
+# CHANNELS
 C_in_1 = 32 # channels input to first conv
-C_out_1_unpadded = 184
-C_out_1 = 256
+C_out_1 = 184
 
 C_in_2 = C_out_1
-C_in_2_unpadded = C_out_1_unpadded
-C_out_2_unpadded = C_in_2_unpadded
 C_out_2 = C_in_2 # 2nd conv keeps channels the same
 
 C_in_3 = C_out_2
-C_in_3_unpadded = C_out_2_unpadded
-C_out_3_unpadded = 56
-C_out_3 = 64
+C_out_3 = 56
 
 # Rules:
 
