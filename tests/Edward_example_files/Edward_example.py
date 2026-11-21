@@ -163,6 +163,7 @@ print("mult. depth:", kc_opt.depth())
 
 
 # # --- LOWERING --- BE WARNED: THIS TAKES A WHILE
+## Could probably make this a lot faster with 'args.skip_toy_eval_checks = True', which is used in some tests
 # circuit_ir = Lower(kernel).run()
 # inputs = {"input": concrete_input, "filter_expand_conv": concrete_filter_expand_conv, 
 #           "filter_depth_conv": concrete_filter_depth_conv, "filter_project_conv": concrete_filter_project_conv, 
