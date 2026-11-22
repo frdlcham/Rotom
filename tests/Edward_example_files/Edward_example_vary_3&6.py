@@ -59,7 +59,7 @@ T = 3
 filter_shape_2nd_conv = [C_out_2, ceil_div(T, STRIDE_conv_1), 3, 3] # C, Kd, Kh, Kw
 
 for j in range(len(H_W_array)):
-    H = W = H_W_array[j % len(H_W_array)]
+    H = W = H_W_array[j]
 
     for k in range(len(STRIDE_conv_2_array)):
         STRIDE_conv_2 = STRIDE_conv_2_array[k]

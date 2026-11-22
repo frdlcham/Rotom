@@ -57,11 +57,11 @@ filter_shape_1st_conv = [C_out_1, C_in_1, 1, 1, 1]  # C_out, C_in, Kd, Kh, Kw
 filter_shape_3rd_conv = [C_out_3, C_in_3, 1, 1, 1] # C_out, C_in, Kd, Kh, Kw
 
 for i in range(len(T_array)):
-    T = T_array[i % len(T_array)]
+    T = T_array[i]
     filter_shape_2nd_conv = [C_out_2, ceil_div(T, STRIDE_conv_1), 3, 3] # C, Kd, Kh, Kw
 
     for j in range(len(H_W_array)):
-        H = W = H_W_array[j % len(H_W_array)]
+        H = W = H_W_array[j]
 
         for k in range(len(STRIDE_conv_2_array)):
             STRIDE_conv_2 = STRIDE_conv_2_array[k]
